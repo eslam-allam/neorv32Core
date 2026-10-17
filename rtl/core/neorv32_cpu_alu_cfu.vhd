@@ -1,12 +1,16 @@
 -- ================================================================================ --
--- NEORV32 CPU - ALU Custom Functions Unit (CFU) - Keccak-f1600 permutation engine   --
+-- NEORV32 CPU - ALU Custom Functions Unit (CFU) - accelerator dispatcher             --
 -- -------------------------------------------------------------------------------- --
 -- See the CPU's data sheet (docs/datasheet/cpu_cfu.adoc) for the CFU interface.     --
 -- -------------------------------------------------------------------------------- --
--- This CFU replaces the upstream XTEA example. It is a stateful Keccak-f1600        --
--- (FIPS 202) permutation engine, shared by ML-KEM (FIPS 203) and ML-DSA (FIPS 204). --
+-- One CFU slot, several accelerator *engines*, selected by funct3. This file holds   --
+-- the Keccak-f1600 engine inline (a stateful FIPS 202 permutation engine, shared by  --
+-- ML-KEM (FIPS 203) and ML-DSA (FIPS 204)) and dispatches funct3 = 110 to the        --
+-- polynomial NTT engine in neorv32_cpu_alu_cfu_ntt.vhd (also shared by both PQC      --
+-- schemes; see that file and docs/cfu_ntt.md). The engines are independent: they     --
+-- never run at the same time, so they share the one CPU co-processor port.           --
 --                                                                                  --
--- AREA OPTIMIZED ("serialized") VARIANT.                                             --
+-- Keccak AREA OPTIMIZED ("serialized") VARIANT.                                      --
 -- The first implementation computed a whole 1600-bit round per clock, which made    --
 -- the CFU by far the largest block in the design (~3.8k LUT, of which ~1.6k is the   --
 -- chi layer and ~0.6k the theta C/D layer -- both scale linearly with the datapath  --
@@ -34,7 +38,13 @@
 --   funct3 = 011 -> READ_HI  : rd := lane[rs2][63:32]                               --
 --   funct3 = 100 -> PERM     : perform ONE Keccak-f1600 round (multi-cycle)         --
 --   funct3 = 101 -> CLEAR    : zero the whole 1600-bit state (multi-cycle)          --
+--   funct3 = 110 -> NTT      : forwarded to the NTT engine (see below)              --
 --   all other funct3 values return valid_o = '0' -> illegal instruction trap        --
+--                                                                                  --
+-- The NTT engine (funct3 = 110) is a separate entity, neorv32_cpu_alu_cfu_ntt, and  --
+-- uses funct7 as its sub-opcode (0 = CLEAR, 1 = MODE, 2 = WRITE, 3 = READ,          --
+-- 4 = SETPTR, 5 = LAYER). Its 256-coefficient scratchpad and twiddle ROM live       --
+-- inside that entity; the CFU top level only multiplexes result_o / valid_o.        --
 --                                                                                  --
 -- R-type (not I-type) is used so the lane index can be a *register* operand: a      --
 -- software loop counter cannot be an I-type immediate under the ".insn" intrinsic's --
@@ -92,6 +102,7 @@ architecture neorv32_cpu_alu_cfu_rtl of neorv32_cpu_alu_cfu is
   constant cfu_read_hi_c    : std_ulogic_vector(2 downto 0) := "011";
   constant cfu_perm_c       : std_ulogic_vector(2 downto 0) := "100";
   constant cfu_clear_c      : std_ulogic_vector(2 downto 0) := "101";
+  constant cfu_ntt_c        : std_ulogic_vector(2 downto 0) := "110"; -- NTT engine select
 
   -- rho rotation offsets rho[x][y] --
   type rho_array_t is array (0 to 4, 0 to 4) of natural;
@@ -189,6 +200,12 @@ architecture neorv32_cpu_alu_cfu_rtl of neorv32_cpu_alu_cfu is
   signal funct3   : std_ulogic_vector(2 downto 0);
   signal lane_idx : std_ulogic_vector(4 downto 0);
   signal lane_ok  : std_ulogic;
+
+  -- accelerator engines: one CFU slot, several engines selected by funct3 --
+  signal keccak_result_o : std_ulogic_vector(31 downto 0);
+  signal keccak_valid_o  : std_ulogic;
+  signal ntt_result_o    : std_ulogic_vector(31 downto 0);
+  signal ntt_valid_o     : std_ulogic;
 
   -- sequencer --
   type state_t is (S_IDLE, S_CLEAR, S_THA, S_THW, S_DLD, S_DCM,
@@ -512,22 +529,39 @@ begin
   -- Function Result Select ------------------------------------------------------------------
   result_proc: process(op_valid, funct3, state, rd_a, done)
   begin
-    result_o <= rd_a; -- read operations return the addressed bank entry
-    valid_o  <= '0';
+    keccak_result_o <= rd_a; -- read operations return the addressed bank entry
+    keccak_valid_o  <= '0';
     if (op_valid = '1') then
       case funct3 is
         when cfu_read_lo_c | cfu_read_hi_c | cfu_write_lo_c | cfu_write_hi_c =>
           if (state = S_IDLE) then
-            valid_o <= '1';
+            keccak_valid_o <= '1';
           else
-            valid_o <= '0';
+            keccak_valid_o <= '0';
           end if;
         when cfu_perm_c | cfu_clear_c =>
-          valid_o <= done;
+          keccak_valid_o <= done;
         when others =>
-          valid_o <= '0'; -- illegal instruction
+          keccak_valid_o <= '0'; -- not handled by the Keccak engine (e.g. the NTT engine)
       end case;
     end if;
   end process result_proc;
+
+  -- NTT Engine (stdlib sub-unit; consumes funct3 = 110) ------------------------------------
+  ntt_engine: entity neorv32.neorv32_cpu_alu_cfu_ntt
+  port map (
+    clk_i    => clk_i,
+    rstn_i   => rstn_i,
+    start_i  => start_i,
+    inst_i   => inst_i,
+    rs1_i    => rs1_i,
+    rs2_i    => rs2_i,
+    result_o => ntt_result_o,
+    valid_o  => ntt_valid_o
+  );
+
+  -- Response mux: the engine addressed by funct3 owns the CFU response ----------------------
+  result_o <= ntt_result_o when (funct3 = cfu_ntt_c) else keccak_result_o;
+  valid_o  <= ntt_valid_o  when (funct3 = cfu_ntt_c) else keccak_valid_o;
 
 end neorv32_cpu_alu_cfu_rtl;
