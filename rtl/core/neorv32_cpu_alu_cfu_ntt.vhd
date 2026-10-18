@@ -9,8 +9,9 @@
 -- dominated by coefficient transfer, not arithmetic. Instead the CFU owns a 256 x    --
 -- 32-bit coefficient scratchpad plus the twiddle-factor ROM; software streams the    --
 -- polynomial in once, issues one op per NTT layer, and streams it out. The datapath  --
--- then iterates internally and only the (unavoidable) 2 x 256 operand transfers      --
--- cross the register port. This mirrors the "bulk/streaming over register           --
+-- then iterates internally and only the (unavoidable) operand transfers cross the    --
+-- register port (ML-KEM packs two int16 per word -> 2 x 128 ops; ML-DSA moves int32  --
+-- -> 2 x 256 ops). This mirrors the "bulk/streaming over register                    --
 -- shuffling" design rule learned from the Keccak CFU.                                --
 --                                                                                  --
 -- WHY THREE BANKS: the scratchpad MUST infer as distributed RAM (a flip-flop array   --
@@ -68,8 +69,11 @@
 -- CFU instruction set (CUSTOM-0, R-type; funct3 = 110 selects this engine):          --
 --   sub-op (funct7) = 0000000 -> CLEAR  : zero the scratchpad, reset ptr/layer        --
 --   sub-op (funct7) = 0000001 -> MODE   : rs1[0] = 0 -> ML-KEM, 1 -> ML-DSA           --
---   sub-op (funct7) = 0000010 -> WRITE  : scratchpad[ptr++] := rs1                    --
---   sub-op (funct7) = 0000011 -> READ   : rd := scratchpad[ptr++]                     --
+--   sub-op (funct7) = 0000010 -> WRITE  : scratchpad[ptr] := rs1, ptr := ptr + step     --
+--   sub-op (funct7) = 0000011 -> READ   : rd := scratchpad[ptr], ptr := ptr + step      --
+--     step = coefficient granularity: ML-KEM packs TWO int16 into one 32-bit word       --
+--     (step = 2; low half = coeff[2i], high half = coeff[2i+1]), so a transform moves   --
+--     128 words; ML-DSA moves one int32 per op (step = 1, 256 words).                   --
 --   sub-op (funct7) = 0000100 -> SETPTR : ptr := rs1                                  --
 --   sub-op (funct7) = 0000101 -> LAYER  : run ONE forward NTT layer (multi-cycle)     --
 --   The layer index lives in the CFU and advances/wraps (1..NL), so back-to-back      --
@@ -146,6 +150,7 @@ architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
   subtype bo_t is unsigned(8 downto 0);
   constant bo_zero_c : bo_t := (others => '0'); -- index 0
   constant bo_one_c  : bo_t := "010000000";     -- bank 1, offset 0 -> index 1
+  constant bo_two_c  : bo_t := "100000000";     -- bank 2, offset 0 -> index 2
 
   -- add two (bank, offset) pairs: bank sums modulo 3, overflow carries into offset --
   function bo_add(a : bo_t; b : bo_t) return bo_t is
@@ -317,8 +322,8 @@ begin
       rd_a <= bo_zero_c;    -- first butterfly: a = index 0
       rd_b <= len_nxt_b;    --                    b = index len
     else
-      rd_a <= ptr_bo;       -- stream read (READ op) / don't care
-      rd_b <= ptr_bo;
+      rd_a <= ptr_bo;                     -- stream read (READ op): word at ptr
+      rd_b <= bo_add(ptr_bo, bo_one_c);   -- partner word ptr+1 (ML-KEM pairing)
     end if;
   end process rd_sel_proc;
 
@@ -344,15 +349,23 @@ begin
   -- Write Data / Enable ---------------------------------------------------------------------
   -- The butterfly result is written one cycle after it is computed (S_M1 of the next
   -- butterfly), when the scratchpad write port is otherwise idle.
+  -- In ML-KEM mode a WRITE carries TWO coefficients: slot 0 gets coeff[2i] (the low half
+  -- of rs1, sign-extended) at index ptr, slot 1 gets coeff[2i+1] (the high half) at
+  -- index ptr+1. Those two indices are in DIFFERENT banks, so this rides for free on
+  -- the butterfly's two write slots.
   wr0_bo <= wra_r when (state = S_M1) else ptr_bo when (state = S_IDLE) else clr_bo;
-  wr1_bo <= wrb_r when (state = S_M1) else bo_zero_c;
+  wr1_bo <= wrb_r when (state = S_M1) else bo_add(ptr_bo, bo_one_c);
   wr0_en <= '1' when ((state = S_M1) and (wr_pend = '1')) or (state = S_CLEAR) or
-                       ((state = S_IDLE) and (start = '1') and (subop = sub_write_c)) else '0';
-  wr1_en   <= '1' when ((state = S_M1) and (wr_pend = '1')) else '0';
-  wr0_data <= sum_v   when (state = S_M1) else
-              rs1_i   when (subop = sub_write_c) else
+                      ((state = S_IDLE) and (start = '1') and (subop = sub_write_c)) else '0';
+  wr1_en <= '1' when ((state = S_M1) and (wr_pend = '1')) or
+                     ((state = S_IDLE) and (start = '1') and (subop = sub_write_c) and (mode = '0')) else '0';
+  wr0_data <= sum_v when (state = S_M1) else
+              std_ulogic_vector(resize(signed(rs1_i(15 downto 0)), 32)) when ((subop = sub_write_c) and (mode = '0')) else
+              rs1_i when (subop = sub_write_c) else
               (others => '0'); -- CLEAR writes zeros
-  wr1_data <= dif_v;
+  wr1_data <= dif_v when (state = S_M1) else
+              std_ulogic_vector(resize(signed(rs1_i(31 downto 16)), 32)) when ((subop = sub_write_c) and (mode = '0')) else
+              (others => '0');
 
   -- Write Address Steer (combinational from registers only) ---------------------------------
   -- A butterfly's a' and b' always target DIFFERENT banks (a and b never collide), so at most
@@ -480,12 +493,22 @@ begin
                 layer <= to_unsigned(1, layer'length); -- MODE restarts at layer 1
                 done  <= '1';
               when sub_write_c =>
-                ptr    <= ptr + 1;
-                ptr_bo <= bo_add(ptr_bo, bo_one_c);
+                if (mode = '0') then -- ML-KEM: one word = two packed int16
+                  ptr    <= ptr + 2;
+                  ptr_bo <= bo_add(ptr_bo, bo_two_c);
+                else
+                  ptr    <= ptr + 1;
+                  ptr_bo <= bo_add(ptr_bo, bo_one_c);
+                end if;
                 done   <= '1';
               when sub_read_c =>
-                ptr    <= ptr + 1;
-                ptr_bo <= bo_add(ptr_bo, bo_one_c);
+                if (mode = '0') then -- ML-KEM: one word = two packed int16
+                  ptr    <= ptr + 2;
+                  ptr_bo <= bo_add(ptr_bo, bo_two_c);
+                else
+                  ptr    <= ptr + 1;
+                  ptr_bo <= bo_add(ptr_bo, bo_one_c);
+                end if;
                 done   <= '1';
               when sub_setptr_c =>
                 ptr    <= unsigned(rs1_i(8 downto 0));
@@ -574,7 +597,13 @@ begin
   end process seq_proc;
 
   -- Function Result Select ------------------------------------------------------------------
-  result_o <= d_a; -- in S_IDLE this is scratchpad[ptr] for the READ op
+  -- The low half of a READ always comes from the word at ptr. In ML-KEM mode that word
+  -- holds two packed int16 coefficients, so the high half comes from the partner word
+  -- (ptr + 1) reached through rd_b / d_b; in ML-DSA mode it is the top half of the same
+  -- word. Everything else the CPU could capture is don't-care.
+  result_o(15 downto 0)  <= d_a(15 downto 0);
+  result_o(31 downto 16) <= d_b(15 downto 0) when ((state = S_IDLE) and (mode = '0') and (subop = sub_read_c)) else
+                            d_a(31 downto 16);
 
   valid_proc: process(op_valid, state, subop, done)
   begin
