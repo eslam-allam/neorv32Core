@@ -76,8 +76,32 @@
 --     128 words; ML-DSA moves one int32 per op (step = 1, 256 words).                   --
 --   sub-op (funct7) = 0000100 -> SETPTR : ptr := rs1                                  --
 --   sub-op (funct7) = 0000101 -> LAYER  : run ONE forward NTT layer (multi-cycle)     --
+--   sub-op (funct7) = 0000110 -> SCALE  : multiply the 128 coefficients at ptr by   
+--     the mode constant (multi-cycle); ptr := ptr + 128. Issued twice per poly:     
+--     ML-KEM pre-scales by 1441 BEFORE the layers, ML-DSA post-scales by 41978      
+--     AFTER them (exact library order).                                             
+--   sub-op (funct7) = 0000111 -> LAYER_INV : run ONE inverse NTT layer (multi-cycle)
 --   The layer index lives in the CFU and advances/wraps (1..NL), so back-to-back      --
---   LAYER ops just work; MODE or CLEAR restarts at layer 1.                           --
+--   LAYER ops just work; MODE or CLEAR restarts at layer 1. LAYER_INV shares the    
+--   counter (op k runs library layer NL+1-k), so both directions wrap seamlessly.  
+--                                                                                  
+-- INVERSE BUTTERFLY (mlk_invntt_layer / mld_invntt_layer):                          
+--   ML-KEM: a' = barrett(a+b), b' = fqmul(b-a, +zeta)                               
+--   ML-DSA: a' = a+b (plain; bounds grow to 256q, fits int32),                      
+--           b' = fqmul(a-b, -zeta) -- the twiddle is NEGATED                        
+--   The zeta index runs in REVERSE block order (2*nblk-1-blk) over the unchanged    
+--   forward zeta ROM. ML-KEM's barrett uses comparator thresholds instead of a      
+--   multiply: t = 2 (x>=4994), 1 (x>=1665), 0 (x>=-1664), -1 (x>=-4993), -2 else,  
+--   res = x - t*q; exact for the reachable range |x| < 2q (exhaustively proved     
+--   against the C formula in gen_ntt_vectors.py).                                   
+--   SCALE walks the 128 scratchpad slots at ptr..ptr+127 and pushes each        
+--   coefficient through the same 3-cycle Montgomery pipeline (one coefficient    
+--   per 3 cycles, next operand prefetched in the third cycle), writing the      
+--   reduced result back to the same slot. The scratchpad always holds ONE      
+--   coefficient per 32-bit slot - the ML-KEM two-per-word packing is a         
+--   transfer property, not a storage one - so no half/hi-half handling is       
+--   needed here. One SCALE op therefore costs 128*3 + 2 = 386 cycles, the      
+--   same as a LAYER op. Every op stays within the 512-cycle window.             
 --                                                                                  --
 -- Round constants in neorv32_cpu_alu_cfu_ntt_zetas.vhd are AUTO-GENERATED from the   --
 -- libraries' own zetas.inc so hardware and software use identical twiddles.           --
@@ -124,6 +148,8 @@ architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
   constant sub_read_c   : std_ulogic_vector(6 downto 0) := "0000011";
   constant sub_setptr_c : std_ulogic_vector(6 downto 0) := "0000100";
   constant sub_layer_c  : std_ulogic_vector(6 downto 0) := "0000101";
+  constant sub_scale_c  : std_ulogic_vector(6 downto 0) := "0000110";
+  constant sub_layeri_c : std_ulogic_vector(6 downto 0) := "0000111";
 
   -- ML-KEM modulus parameters (q = 3329, R = 2^16) --
   constant kem_q_c     : integer := 3329;
@@ -136,6 +162,10 @@ architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
   constant dsa_qinv_c  : integer := 58728449;
   constant dsa_shift_c : integer := 32;
   constant dsa_nlay_c  : integer := 8;
+
+  -- inverse-NTT scale constants (mlkem-native pre-scale / mldsa-native post-scale) --
+  constant kem_fscale_c : integer := 1441;  -- pow(2, 25, q)
+  constant dsa_fscale_c : integer := 41978; -- pow(2, 56, q)
 
   -- coefficient scratchpad: THREE interleaved banks, each 86 x 32-bit LUTRAM --
   -- coefficient index i lives in bank (i mod 3) at offset (i / 3) --
@@ -181,6 +211,20 @@ architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
     return r;
   end function bo_of;
 
+  -- ML-KEM Barrett reduction in comparator form (exact for |x| < 2q):               
+  -- res = x - t*q with t from the thresholds below. Avoids a multiplier. The       
+  -- equivalence with the C formula ((20159*x + 2^25) >> 26) is proved              
+  -- exhaustively over [-2q, 2q] by gen_ntt_vectors.py.                             
+  function kem_barrett(x : signed(31 downto 0)) return signed is                    
+  begin                                                                              
+    if    (x >= to_signed(4994, 32)) then return x - to_signed(6658, 32);            
+    elsif (x >= to_signed(1665, 32)) then return x - to_signed(3329, 32);            
+    elsif (x >= to_signed(-1664, 32)) then return x;                                 
+    elsif (x >= to_signed(-4993, 32)) then return x + to_signed(3329, 32);            
+    else                                   return x + to_signed(6658, 32);            
+    end if;                                                                          
+  end function kem_barrett;                                                          
+
   -- instruction decode (combinational) --
   signal op_valid : std_ulogic;
   signal start    : std_ulogic;
@@ -209,6 +253,7 @@ architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
   -- twiddle factor --
   signal zeta_idx : unsigned(8 downto 0); -- ROM index = nblk + blk
   signal zeta_val : signed(31 downto 0);
+  signal zeta_eff : signed(31 downto 0);   -- twiddle fed to mul1 (negated for ML-DSA invNTT)
 
   -- registered scratchpad address decode (bank, offset) --
   signal cur_a  : bo_t; -- current butterfly operand a (index j)
@@ -232,6 +277,7 @@ architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
   signal w0e, w1e, w2e : std_ulogic;           -- per-bank write enable
   signal wr0_en, wr1_en : std_ulogic;
   signal wr0_data, wr1_data : std_ulogic_vector(31 downto 0);
+  signal rm_r_v : std_ulogic_vector(31 downto 0); -- rm_r as a write-data vector
 
   -- shared multiplier (LUT-only by design: no DSP inference) --
   signal mul_a, mul_b : signed(31 downto 0);
@@ -247,6 +293,7 @@ architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
   -- butterfly datapath registers (multiplier operands are ALWAYS registered) --
   signal coeff_a : std_ulogic_vector(31 downto 0); -- 'a' operand of the current butterfly
   signal coeff_b : std_ulogic_vector(31 downto 0); -- 'b' operand of the current butterfly
+  signal coeff_d : std_ulogic_vector(31 downto 0); -- inverse: registered (b-a)/(a-b) of the current butterfly
   signal p1      : signed(63 downto 0);            -- mul1: x * y (64-bit signed product)
   signal m_red   : unsigned(63 downto 0);          -- mul2: low(x*y) * QINV
 
@@ -258,6 +305,10 @@ architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
   signal wrb_r   : bo_t;                           -- deferred write address (b')
   signal wr_pend : std_ulogic;                     -- a butterfly result is waiting to be written
   signal last_bf : std_ulogic;                     -- last butterfly: one flush cycle left
+  signal inv   : std_ulogic;               -- current op is LAYER_INV
+  signal scl   : std_ulogic;               -- current op is SCALE
+  signal sc_w  : unsigned(6 downto 0);     -- scale word counter (0..127)
+  signal waddr : bo_t;                     -- scale: current word address
 
   -- reduction / write datapath (combinational, consumed during S_M1) --
   signal rm_r  : signed(31 downto 0); -- reduced Montgomery product
@@ -265,6 +316,18 @@ architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
   signal dif_i : signed(31 downto 0); -- qa_r - rm_r
   signal sum_v : std_ulogic_vector(31 downto 0);
   signal dif_v : std_ulogic_vector(31 downto 0);
+  signal qb_r     : std_ulogic_vector(31 downto 0); -- inverse: butterfly 'b' kept for a+b
+  signal dif_pre  : signed(31 downto 0);   -- combinational (b-a)/(a-b) latched into coeff_d
+  signal sum_inv  : signed(31 downto 0);   -- inverse a' = qa_r + qb_r (pre-Barrett/trunc)
+  signal inv0_v   : std_ulogic_vector(31 downto 0); -- inverse a' write data (Barrett for KEM)
+  signal f_scale  : signed(31 downto 0);   -- SCALE multiply constant (mode dependent)
+  signal len_inv  : unsigned(8 downto 0);  -- inverse layer length = 256 >> (NL+1-layer)
+  signal len_inv_b : bo_t;
+  signal nblk_inv : unsigned(8 downto 0);  -- inverse #blocks = 1 << (NL-layer)
+  signal ptr128   : unsigned(8 downto 0);  -- SCALE end pointer = ptr + 128
+  signal ptr128_b : bo_t;
+  signal sc_nxt_w : bo_t;                  -- next scale word address
+  signal sc_last  : unsigned(6 downto 0);  -- last scale word (127: 128 words per op both modes)
 
 begin
 
@@ -280,12 +343,28 @@ begin
   -- Layer Geometry (combinational, latched at layer start) ---------------------------------
   len_nxt   <= shift_right(to_unsigned(256, len_nxt'length), to_integer(layer));
   len_nxt_b <= bo_of(len_nxt);
+
+  -- inverse layer geometry: op k runs library layer NL+1-k ---------------------------
+  len_inv   <= shift_right(to_unsigned(256, len_inv'length), to_integer(nlay + 1 - layer));
+  len_inv_b <= bo_of(len_inv);
+  nblk_inv  <= shift_left(to_unsigned(1, nblk'length), to_integer(nlay - layer));
+  zeta_eff  <= zeta_val when ((mode = '0') or (inv = '0')) else -zeta_val;
+  f_scale   <= to_signed(kem_fscale_c, 32) when (mode = '0') else to_signed(dsa_fscale_c, 32);
+  dif_pre   <= signed(d_b) - signed(d_a) when (mode = '0') else signed(d_a) - signed(d_b);
+  sum_inv   <= signed(qa_r) + signed(qb_r);
+  inv0_v    <= std_ulogic_vector(kem_barrett(resize(signed(sum_inv(15 downto 0)), 32)))
+              when (mode = '0') else std_ulogic_vector(sum_inv);
+  ptr128    <= ptr + 128;
+  ptr128_b  <= bo_of(ptr + 128);
+  sc_nxt_w  <= bo_add(waddr, bo_one_c); -- both modes: one coefficient per word
+  sc_last   <= to_unsigned(127, sc_last'length); -- 128 words per SCALE op
   is_last   <= '1' when (jj = len - 1) and (blk = nblk - 1) else '0';
 
   -- Twiddle Factor Select -------------------------------------------------------------------
   -- zeta index = (1 << (layer-1)) + blk == nblk + blk. The ROM is a table of integers (see
   -- neorv32_cpu_alu_cfu_ntt_zetas.vhd); convert to the signed datapath type here.
-  zeta_idx <= nblk + blk;
+  -- forward: nblk + blk; inverse: REVERSE block order 2*nblk - 1 - blk              
+  zeta_idx <= shift_left(nblk, 1) - 1 - blk when (inv = '1') else nblk + blk;         
   zeta_proc: process(mode, zeta_idx)
   begin
     if (mode = '0') then -- ML-KEM: 128 int16 twiddles (index 0..127)
@@ -305,9 +384,13 @@ begin
   -- S_M3 reads the NEXT butterfly's operands (this butterfly's read/write ports are separate,
   -- so the overlap is free); the last butterfly of a layer must not issue the out-of-range
   -- next address, so it re-reads its own (harmless -- the result is only latched, not used).
-  rd_sel_proc: process(state, start, subop, is_last, cur_a, cur_b, nxt_a, nxt_b, ptr_bo, len_nxt_b)
+  rd_sel_proc: process(state, start, subop, is_last, cur_a, cur_b, nxt_a, nxt_b, ptr_bo,
+                       len_nxt_b, scl, sc_nxt_w, len_inv_b)
   begin
-    if (state = S_M3) then
+    if (state = S_M3) and (scl = '1') then
+      rd_a <= sc_nxt_w;                    -- SCALE: prefetch the next word
+      rd_b <= bo_add(sc_nxt_w, bo_one_c);
+    elsif (state = S_M3) then
       if (is_last = '0') then
         rd_a <= nxt_a;
         rd_b <= nxt_b;
@@ -321,6 +404,9 @@ begin
     elsif (state = S_IDLE) and (start = '1') and (subop = sub_layer_c) then
       rd_a <= bo_zero_c;    -- first butterfly: a = index 0
       rd_b <= len_nxt_b;    --                    b = index len
+    elsif (state = S_IDLE) and (start = '1') and (subop = sub_layeri_c) then
+      rd_a <= bo_zero_c;    -- inverse layer: same first-butterfly fetch
+      rd_b <= len_inv_b;
     else
       rd_a <= ptr_bo;                     -- stream read (READ op): word at ptr
       rd_b <= bo_add(ptr_bo, bo_one_c);   -- partner word ptr+1 (ML-KEM pairing)
@@ -357,13 +443,18 @@ begin
   wr1_bo <= wrb_r when (state = S_M1) else bo_add(ptr_bo, bo_one_c);
   wr0_en <= '1' when ((state = S_M1) and (wr_pend = '1')) or (state = S_CLEAR) or
                       ((state = S_IDLE) and (start = '1') and (subop = sub_write_c)) else '0';
-  wr1_en <= '1' when ((state = S_M1) and (wr_pend = '1')) or
+  -- SCALE writes only slot 0 (one coefficient per word); butterflies and the inverse
+  -- layer write both slots.
+  wr1_en <= '1' when ((state = S_M1) and (wr_pend = '1') and (scl = '0')) or
                      ((state = S_IDLE) and (start = '1') and (subop = sub_write_c) and (mode = '0')) else '0';
-  wr0_data <= sum_v when (state = S_M1) else
+  wr0_data <= rm_r_v when ((state = S_M1) and (scl = '1')) else -- SCALE (both modes)
+              inv0_v when ((state = S_M1) and (inv = '1')) else -- inverse a' (Barrett/plain)
+              sum_v  when (state = S_M1) else
               std_ulogic_vector(resize(signed(rs1_i(15 downto 0)), 32)) when ((subop = sub_write_c) and (mode = '0')) else
               rs1_i when (subop = sub_write_c) else
               (others => '0'); -- CLEAR writes zeros
-  wr1_data <= dif_v when (state = S_M1) else
+  wr1_data <= rm_r_v when ((state = S_M1) and ((scl = '1') or (inv = '1'))) else -- scale hi / inverse b'
+              dif_v  when (state = S_M1) else
               std_ulogic_vector(resize(signed(rs1_i(31 downto 16)), 32)) when ((subop = sub_write_c) and (mode = '0')) else
               (others => '0');
 
@@ -400,14 +491,23 @@ begin
   -- Shared Multiplier Operand Select ---------------------------------------------------------
   -- Only REGISTERED values may reach the multiplier; a combinational LUTRAM read here would
   -- create a false read -> mul1 -> reduce -> write path that spans the whole pipeline.
-  mul_proc: process(state, mode, coeff_b, p1, m_red, zeta_val)
+  mul_proc: process(state, mode, scl, inv, coeff_a, coeff_b, coeff_d, p1, m_red,
+                    zeta_val, zeta_eff, f_scale)
   begin
     mul_a <= (others => '0');
     mul_b <= (others => '0');
     case state is
-      when S_M1 => -- mul1: coefficient * twiddle
-        mul_a <= signed(coeff_b);
-        mul_b <= zeta_val;
+      when S_M1 => -- mul1: coefficient*twiddle | inverse difference*twiddle | scale
+        if (scl = '1') then
+          mul_a <= signed(coeff_a); -- one full word = one coefficient (both modes)
+          mul_b <= f_scale;
+        elsif (inv = '1') then -- inverse butterfly: (b-a)/(a-b) * twiddle
+          mul_a <= signed(coeff_d);
+          mul_b <= zeta_eff;
+        else
+          mul_a <= signed(coeff_b);
+          mul_b <= zeta_val;
+        end if;
       when S_M2 => -- mul2: low(x*y) * QINV
         if (mode = '0') then
           mul_a <= signed(resize(unsigned(p1(15 downto 0)), 32));
@@ -437,6 +537,7 @@ begin
              shift_right(p1 - resize(mul_p, 64), dsa_shift_c);
 
   rm_r <= resize(signed(red64_r(15 downto 0)), 32) when (mode = '0') else red64_r(31 downto 0);
+  rm_r_v <= std_ulogic_vector(rm_r);
 
   -- ML-KEM stores int16 coefficients, so the butterfly add/sub is truncated to 16 bits just
   -- like the C reference. ML-DSA is int32 throughout and wraps naturally at 32 bits.
@@ -473,6 +574,12 @@ begin
       wrb_r   <= bo_zero_c;
       wr_pend <= '0';
       last_bf <= '0';
+      coeff_d <= (others => '0');
+      qb_r    <= (others => '0');
+      inv     <= '0';
+      scl     <= '0';
+      sc_w    <= (others => '0');
+      waddr   <= bo_zero_c;
       done    <= '0';
     elsif rising_edge(clk_i) then
       done <= '0'; -- default: single-cycle completion pulse
@@ -488,9 +595,13 @@ begin
                 ptr    <= (others => '0');
                 ptr_bo <= bo_zero_c;
                 layer  <= to_unsigned(1, layer'length);
+                inv    <= '0';
+                scl    <= '0';
               when sub_mode_c =>
                 mode  <= rs1_i(0);
                 layer <= to_unsigned(1, layer'length); -- MODE restarts at layer 1
+                inv   <= '0';
+                scl   <= '0';
                 done  <= '1';
               when sub_write_c =>
                 if (mode = '0') then -- ML-KEM: one word = two packed int16
@@ -516,6 +627,8 @@ begin
                 done   <= '1';
               when sub_layer_c =>
                 -- fetch the layer geometry and latch butterfly 0's operands
+                inv     <= '0';
+                scl     <= '0';
                 len     <= len_nxt;
                 nblk    <= shift_left(to_unsigned(1, nblk'length), to_integer(layer) - 1);
                 len_bo  <= len_nxt_b;
@@ -525,6 +638,32 @@ begin
                 cur_b   <= len_nxt_b;             --                    b = a + len
                 coeff_a <= d_a;                   -- latch operand a (index 0)
                 coeff_b <= d_b;                   -- latch operand b (index len)
+                coeff_d <= std_ulogic_vector(dif_pre);               -- latch (b-a)/(a-b) (unused forward)
+                state   <= S_M1;
+              when sub_layeri_c =>
+                -- inverse layer: same first-butterfly fetch, NL+1-layer geometry
+                inv     <= '1';
+                scl     <= '0';
+                len     <= len_inv;
+                nblk    <= nblk_inv;
+                len_bo  <= len_inv_b;
+                blk     <= (others => '0');
+                jj      <= (others => '0');
+                cur_a   <= bo_zero_c;
+                cur_b   <= len_inv_b;
+                coeff_a <= d_a;
+                coeff_b <= d_b;
+                coeff_d <= std_ulogic_vector(dif_pre);
+                state   <= S_M1;
+              when sub_scale_c =>
+                -- scale the 128 coefficients at ptr (two ops cover one poly)
+                inv     <= '0';
+                scl     <= '1';
+                sc_w    <= (others => '0');
+                waddr   <= ptr_bo;               -- first word's address
+                ptr     <= ptr128;               -- ptr := ptr + 128
+                ptr_bo  <= ptr128_b;
+                coeff_a <= d_a;                  -- the word at ptr (stream read)
                 state   <= S_M1;
               when others =>
                 null;
@@ -548,6 +687,8 @@ begin
             state   <= S_IDLE;
             done    <= '1';
             last_bf <= '0';
+            scl     <= '0';
+            inv     <= '0';
           else
             state <= S_M2;
           end if;
@@ -560,33 +701,51 @@ begin
         -- mul3 + reduce (registered); remember write info; prefetch the NEXT butterfly -----
         when S_M3 =>
           red64_r <= red64_c;
-          qa_r    <= coeff_a; -- this butterfly's 'a' (before the prefetch below overwrites it)
-          wra_r   <= cur_a;
-          wrb_r   <= cur_b;
-          wr_pend <= '1';
-          coeff_a <= d_a; -- prefetch the NEXT butterfly's operand a (the read of nxt_a/nxt_b is
-          coeff_b <= d_b; -- issued this cycle and the read/write ports are separate)
-          if (jj = len - 1) then
-            jj <= (others => '0');
-            if (blk = nblk - 1) then -- layer finished
-              last_bf <= '1';
-              state   <= S_M1;      -- one flush cycle to complete the deferred write
-              if (layer = nlay) then
-                layer <= to_unsigned(1, layer'length); -- wrap: back-to-back LAYER ops
+          if (scl = '1') then
+            -- SCALE: the reduce result is the scaled coefficient; latch the write info
+            -- and prefetch the next word (read issued this cycle)
+            wra_r   <= waddr;
+            wr_pend <= '1';
+            if (sc_w = sc_last) then
+              last_bf <= '1'; -- flush cycle completes the final write
+              state   <= S_M1;
+            else
+              sc_w    <= sc_w + 1;
+              waddr   <= sc_nxt_w;
+              coeff_a <= d_a;
+              state   <= S_M1;
+            end if;
+          else
+            qa_r    <= coeff_a; -- this butterfly's 'a' (before the prefetch below overwrites it)
+            qb_r    <= coeff_b; -- ...and its 'b' (the inverse layer needs a + b)
+            wra_r   <= cur_a;
+            wrb_r   <= cur_b;
+            wr_pend <= '1';
+            coeff_a <= d_a; -- prefetch the NEXT butterfly's operand a (the read of nxt_a/nxt_b is
+            coeff_b <= d_b; -- issued this cycle and the read/write ports are separate)
+            coeff_d <= std_ulogic_vector(dif_pre); -- ...and its registered (b-a)/(a-b)
+            if (jj = len - 1) then
+              jj <= (others => '0');
+              if (blk = nblk - 1) then -- layer finished
+                last_bf <= '1';
+                state   <= S_M1;      -- one flush cycle to complete the deferred write
+                if (layer = nlay) then
+                  layer <= to_unsigned(1, layer'length); -- wrap: back-to-back LAYER ops
+                else
+                  layer <= layer + 1;
+                end if;
               else
-                layer <= layer + 1;
+                blk   <= blk + 1;
+                cur_a <= nxt_a;
+                cur_b <= nxt_b;
+                state <= S_M1;
               end if;
             else
-              blk   <= blk + 1;
+              jj    <= jj + 1;
               cur_a <= nxt_a;
               cur_b <= nxt_b;
               state <= S_M1;
             end if;
-          else
-            jj    <= jj + 1;
-            cur_a <= nxt_a;
-            cur_b <= nxt_b;
-            state <= S_M1;
           end if;
 
         when others =>
@@ -616,7 +775,7 @@ begin
           else
             valid_o <= '0';
           end if;
-        when sub_clear_c | sub_layer_c =>
+        when sub_clear_c | sub_layer_c | sub_scale_c | sub_layeri_c =>
           valid_o <= done;
         when others =>
           valid_o <= '0'; -- unsupported sub-op
