@@ -38,7 +38,9 @@ entity neorv32_cpu_alu is
     RISCV_ISA_Xcfu   : boolean; -- custom (instr.) functions unit
     -- Tuning Options --
     FAST_MUL_EN      : boolean; -- use DSPs for M extension's multiplier
-    FAST_SHIFT_EN    : boolean  -- use barrel shifter for shift operations
+    FAST_SHIFT_EN    : boolean; -- use barrel shifter for shift operations
+    -- CFU tuning --
+    CFU_KECCAK_GEN   : natural := 2 -- Keccak CFU engine generation (1 = wide, 2 = serialized)
   );
   port (
     -- global control --
@@ -273,6 +275,9 @@ begin
   neorv32_cpu_alu_cfu_enabled:
   if RISCV_ISA_Xcfu generate
     neorv32_cpu_alu_cfu_inst: entity neorv32.neorv32_cpu_alu_cfu
+    generic map (
+      CFU_KECCAK_GEN => CFU_KECCAK_GEN
+    )
     port map (
       -- global control --
       clk_i    => clk_i,             -- global clock, rising edge

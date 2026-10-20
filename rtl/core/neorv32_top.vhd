@@ -69,6 +69,7 @@ entity neorv32_top is
     CPU_CONSTT_BR_EN    : boolean                        := false;         -- enable constant-time branches
     CPU_FAST_MUL_EN     : boolean                        := false;         -- use DSPs for M extension's multiplier
     CPU_FAST_SHIFT_EN   : boolean                        := false;         -- use barrel shifter for shift operations
+    CPU_CFU_KECCAK_GEN  : natural                        := 2;             -- Keccak CFU engine generation (1 = wide, 2 = serialized)
     CPU_RF_ARCH_SEL     : natural range 0 to 3           := 0;             -- register file implementation style select
 
     -- Physical Memory Protection (PMP) --
@@ -567,6 +568,7 @@ begin
       CPU_CONSTT_BR_EN    => CPU_CONSTT_BR_EN,
       CPU_FAST_MUL_EN     => CPU_FAST_MUL_EN,
       CPU_FAST_SHIFT_EN   => CPU_FAST_SHIFT_EN,
+      CPU_CFU_KECCAK_GEN  => CPU_CFU_KECCAK_GEN,
       CPU_RF_ARCH_SEL     => CPU_RF_ARCH_SEL,
       -- Physical Memory Protection (PMP) --
       PMP_NUM_REGIONS     => PMP_NUM_REGIONS,

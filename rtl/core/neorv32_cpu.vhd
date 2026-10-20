@@ -63,6 +63,7 @@ entity neorv32_cpu is
     CPU_CONSTT_BR_EN    : boolean;                        -- constant-time branches
     CPU_FAST_MUL_EN     : boolean;                        -- use DSPs for M extension's multiplier
     CPU_FAST_SHIFT_EN   : boolean;                        -- use barrel shifter for shift operations
+    CPU_CFU_KECCAK_GEN  : natural := 2;                   -- Keccak CFU engine generation (1 = wide, 2 = serialized)
     CPU_RF_ARCH_SEL     : natural range 0 to 3;           -- register file implementation style select
     -- Physical Memory Protection (PMP) --
     PMP_NUM_REGIONS     : natural range 0 to 16;          -- number of regions
@@ -432,7 +433,8 @@ begin
     RISCV_ISA_Xcfu   => RISCV_ISA_Xcfu,   -- custom (instr.) functions unit
     -- Tuning Options --
     FAST_MUL_EN      => CPU_FAST_MUL_EN,  -- use DSPs for M extension's multiplier
-    FAST_SHIFT_EN    => CPU_FAST_SHIFT_EN -- use barrel shifter for shift operations
+    FAST_SHIFT_EN    => CPU_FAST_SHIFT_EN, -- use barrel shifter for shift operations
+    CFU_KECCAK_GEN   => CPU_CFU_KECCAK_GEN -- Keccak CFU engine generation
   )
   port map (
     -- global control --
