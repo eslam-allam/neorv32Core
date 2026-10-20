@@ -165,12 +165,19 @@ architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
   constant sub_scale_c  : std_ulogic_vector(6 downto 0) := "0000110";
   constant sub_layeri_c : std_ulogic_vector(6 downto 0) := "0000111";
   constant sub_reduce_c : std_ulogic_vector(6 downto 0) := "0001000";
+  constant sub_tomont_c : std_ulogic_vector(6 downto 0) := "0001001";
 
   -- ML-KEM modulus parameters (q = 3329, R = 2^16) --
   constant kem_q_c     : integer := 3329;
   constant kem_qinv_c  : integer := 62209;
   -- Barrett magic: round(2^26 / MLKEM_Q) = 20159 (the library's own constant)
   constant kem_barrett_magic_c : integer := 20159;
+  -- the Montgomery-conversion constant: 1353 == 2^32 mod MLKEM_Q (the library's
+  -- own constant in mlk_poly_tomont_c()). It is a CONSTANT on purpose: the
+  -- multiplier's B operand must stay "a constant or the twiddle ROM", because a
+  -- general register operand makes the synthesizer re-implement the whole
+  -- multiplier (measured: +428 LUT and -0.5 ns of slack).
+  constant kem_tomont_c : integer := 1353;
   constant kem_shift_c : integer := 16;
   constant kem_nlay_c  : integer := 7;
 
@@ -325,6 +332,7 @@ architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
   signal inv   : std_ulogic;               -- current op is LAYER_INV
   signal scl   : std_ulogic;               -- current op is SCALE
   signal red   : std_ulogic;               -- current op is REDUCE (Barrett)
+  signal tom   : std_ulogic;               -- current op is TOMONT (Montgomery conversion)
   signal red_a_r : signed(31 downto 0);     -- REDUCE: the coefficient being reduced
   signal red_p_r : signed(31 downto 0);     -- REDUCE: t * q
   signal red_dif : signed(31 downto 0);     -- REDUCE: a - t*q (32-bit)
@@ -514,22 +522,30 @@ begin
   -- Shared Multiplier Operand Select ---------------------------------------------------------
   -- Only REGISTERED values may reach the multiplier; a combinational LUTRAM read here would
   -- create a false read -> mul1 -> reduce -> write path that spans the whole pipeline.
-  mul_proc: process(state, mode, scl, inv, red, coeff_a, coeff_b, coeff_d, p1, m_red,
-                    zeta_val, zeta_eff, f_scale)
+  mul_proc: process(state, mode, scl, inv, red, tom, coeff_a, coeff_b, coeff_d, p1,
+                    m_red, zeta_val, zeta_eff, f_scale)
   begin
     mul_a <= (others => '0');
     mul_b <= (others => '0');
     case state is
       when S_M1 => -- mul1: coefficient*twiddle | inverse difference*twiddle | scale | barrett
-        if (scl = '1') then
+        -- NOTE: the ORDER of these tests is timing-critical. The design's limiting
+        -- path is inv_reg -> red64_r (the inverse butterfly's twiddle -> multiplier
+        -- -> reduction), so the 'inv' case must stay the FIRST select: putting any
+        -- other test in front of it would add a mux level to that path.
+        if (inv = '1') then -- inverse butterfly: (b-a)/(a-b) * twiddle
+          mul_a <= signed(coeff_d);
+          mul_b <= zeta_eff;
+        elsif (scl = '1') then
           mul_a <= signed(coeff_a); -- one full word = one coefficient (both modes)
-          mul_b <= f_scale;
+          if (tom = '1') then
+            mul_b <= to_signed(kem_tomont_c, 32); -- the Montgomery-conversion constant
+          else
+            mul_b <= f_scale;       -- the mode's constant
+          end if;
         elsif (red = '1') then -- Barrett: a * magic
           mul_a <= signed(coeff_a);
           mul_b <= to_signed(kem_barrett_magic_c, 32);
-        elsif (inv = '1') then -- inverse butterfly: (b-a)/(a-b) * twiddle
-          mul_a <= signed(coeff_d);
-          mul_b <= zeta_eff;
         else
           mul_a <= signed(coeff_b);
           mul_b <= zeta_val;
@@ -627,6 +643,7 @@ begin
       inv     <= '0';
       scl     <= '0';
       red     <= '0';
+      tom     <= '0';
       red_a_r <= (others => '0');
       red_p_r <= (others => '0');
       sc_w    <= (others => '0');
@@ -716,6 +733,19 @@ begin
                 ptr_bo  <= ptr128_b;
                 coeff_a <= d_a;                  -- the word at ptr (stream read)
                 state   <= S_M1;
+              when sub_tomont_c =>
+                -- Montgomery-multiply the 128 coefficients at ptr by 1353
+                -- (two ops cover one poly). This is the library's tomont:
+                -- fqmul(a, 1353) with 1353 == 2^32 mod q.
+                inv     <= '0';
+                scl     <= '1';
+                tom     <= '1';
+                sc_w    <= (others => '0');
+                waddr   <= ptr_bo;               -- first word's address
+                ptr     <= ptr128;               -- ptr := ptr + 128
+                ptr_bo  <= ptr128_b;
+                coeff_a <= d_a;                  -- the word at ptr (stream read)
+                state   <= S_M1;
               when sub_reduce_c =>
                 -- Barrett-reduce the 128 coefficients at ptr (two ops cover one poly)
                 inv     <= '0';
@@ -755,6 +785,7 @@ begin
             scl     <= '0';
             inv     <= '0';
             red     <= '0';
+            tom     <= '0';
           else
             state <= S_M2;
           end if;
@@ -849,7 +880,8 @@ begin
           else
             valid_o <= '0';
           end if;
-        when sub_clear_c | sub_layer_c | sub_scale_c | sub_layeri_c | sub_reduce_c =>
+        when sub_clear_c | sub_layer_c | sub_scale_c | sub_layeri_c | sub_reduce_c |
+             sub_tomont_c =>
           valid_o <= done;
         when others =>
           valid_o <= '0'; -- unsupported sub-op
