@@ -81,6 +81,20 @@
 --     ML-KEM pre-scales by 1441 BEFORE the layers, ML-DSA post-scales by 41978      
 --     AFTER them (exact library order).                                             
 --   sub-op (funct7) = 0000111 -> LAYER_INV : run ONE inverse NTT layer (multi-cycle)
+--   sub-op (funct7) = 0001000 -> REDUCE : Barrett-reduce the 128 coefficients at ptr
+--     (multi-cycle); two ops cover one poly. ML-KEM only (the library's int16 Barrett
+--     formula). This is the library's OWN formula, implemented verbatim, so the result
+--     is bit-exact with mlkem-native by construction:
+--         t   = (20159*a + 2^25) >> 26        (t in -10..+10)
+--         res = a - t*3329                   (in [-(q-1)/2, (q-1)/2])
+--         out = res + (res < 0 ? q : 0)      (unsigned canonical representative)
+--     The pipeline reuses the Montgomery states with different wiring:
+--         S_M1: p1      <= a * 20159
+--         S_M2: red_p_r <= t * q              (t = (p1 + 2^25) >> 26, a constant shift)
+--         S_M3: red64_r <= a - red_p_r        (+ q if negative)
+--     Note this is NOT the comparator-ladder Barrett used by the inverse transform:
+--     that one is proved exact only for |x| < 2q, while the library's reduce has the
+--     full int16 input range.
 --   The layer index lives in the CFU and advances/wraps (1..NL), so back-to-back      --
 --   LAYER ops just work; MODE or CLEAR restarts at layer 1. LAYER_INV shares the    
 --   counter (op k runs library layer NL+1-k), so both directions wrap seamlessly.  
@@ -150,10 +164,13 @@ architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
   constant sub_layer_c  : std_ulogic_vector(6 downto 0) := "0000101";
   constant sub_scale_c  : std_ulogic_vector(6 downto 0) := "0000110";
   constant sub_layeri_c : std_ulogic_vector(6 downto 0) := "0000111";
+  constant sub_reduce_c : std_ulogic_vector(6 downto 0) := "0001000";
 
   -- ML-KEM modulus parameters (q = 3329, R = 2^16) --
   constant kem_q_c     : integer := 3329;
   constant kem_qinv_c  : integer := 62209;
+  -- Barrett magic: round(2^26 / MLKEM_Q) = 20159 (the library's own constant)
+  constant kem_barrett_magic_c : integer := 20159;
   constant kem_shift_c : integer := 16;
   constant kem_nlay_c  : integer := 7;
 
@@ -307,6 +324,12 @@ architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
   signal last_bf : std_ulogic;                     -- last butterfly: one flush cycle left
   signal inv   : std_ulogic;               -- current op is LAYER_INV
   signal scl   : std_ulogic;               -- current op is SCALE
+  signal red   : std_ulogic;               -- current op is REDUCE (Barrett)
+  signal red_a_r : signed(31 downto 0);     -- REDUCE: the coefficient being reduced
+  signal red_p_r : signed(31 downto 0);     -- REDUCE: t * q
+  signal red_dif : signed(31 downto 0);     -- REDUCE: a - t*q (32-bit)
+  signal red_tr  : signed(15 downto 0);      -- REDUCE: the library's (int16_t) cast
+  signal red_res : signed(31 downto 0);     -- REDUCE: the unsigned canonical result
   signal sc_w  : unsigned(6 downto 0);     -- scale word counter (0..127)
   signal waddr : bo_t;                     -- scale: current word address
 
@@ -385,10 +408,10 @@ begin
   -- so the overlap is free); the last butterfly of a layer must not issue the out-of-range
   -- next address, so it re-reads its own (harmless -- the result is only latched, not used).
   rd_sel_proc: process(state, start, subop, is_last, cur_a, cur_b, nxt_a, nxt_b, ptr_bo,
-                       len_nxt_b, scl, sc_nxt_w, len_inv_b)
+                       len_nxt_b, scl, red, sc_nxt_w, len_inv_b)
   begin
-    if (state = S_M3) and (scl = '1') then
-      rd_a <= sc_nxt_w;                    -- SCALE: prefetch the next word
+    if (state = S_M3) and ((scl = '1') or (red = '1')) then
+      rd_a <= sc_nxt_w;                    -- SCALE / REDUCE: prefetch the next word
       rd_b <= bo_add(sc_nxt_w, bo_one_c);
     elsif (state = S_M3) then
       if (is_last = '0') then
@@ -445,9 +468,9 @@ begin
                       ((state = S_IDLE) and (start = '1') and (subop = sub_write_c)) else '0';
   -- SCALE writes only slot 0 (one coefficient per word); butterflies and the inverse
   -- layer write both slots.
-  wr1_en <= '1' when ((state = S_M1) and (wr_pend = '1') and (scl = '0')) or
+  wr1_en <= '1' when ((state = S_M1) and (wr_pend = '1') and (scl = '0') and (red = '0')) or
                      ((state = S_IDLE) and (start = '1') and (subop = sub_write_c) and (mode = '0')) else '0';
-  wr0_data <= rm_r_v when ((state = S_M1) and (scl = '1')) else -- SCALE (both modes)
+  wr0_data <= rm_r_v when ((state = S_M1) and ((scl = '1') or (red = '1'))) else -- SCALE / REDUCE
               inv0_v when ((state = S_M1) and (inv = '1')) else -- inverse a' (Barrett/plain)
               sum_v  when (state = S_M1) else
               std_ulogic_vector(resize(signed(rs1_i(15 downto 0)), 32)) when ((subop = sub_write_c) and (mode = '0')) else
@@ -491,16 +514,19 @@ begin
   -- Shared Multiplier Operand Select ---------------------------------------------------------
   -- Only REGISTERED values may reach the multiplier; a combinational LUTRAM read here would
   -- create a false read -> mul1 -> reduce -> write path that spans the whole pipeline.
-  mul_proc: process(state, mode, scl, inv, coeff_a, coeff_b, coeff_d, p1, m_red,
+  mul_proc: process(state, mode, scl, inv, red, coeff_a, coeff_b, coeff_d, p1, m_red,
                     zeta_val, zeta_eff, f_scale)
   begin
     mul_a <= (others => '0');
     mul_b <= (others => '0');
     case state is
-      when S_M1 => -- mul1: coefficient*twiddle | inverse difference*twiddle | scale
+      when S_M1 => -- mul1: coefficient*twiddle | inverse difference*twiddle | scale | barrett
         if (scl = '1') then
           mul_a <= signed(coeff_a); -- one full word = one coefficient (both modes)
           mul_b <= f_scale;
+        elsif (red = '1') then -- Barrett: a * magic
+          mul_a <= signed(coeff_a);
+          mul_b <= to_signed(kem_barrett_magic_c, 32);
         elsif (inv = '1') then -- inverse butterfly: (b-a)/(a-b) * twiddle
           mul_a <= signed(coeff_d);
           mul_b <= zeta_eff;
@@ -508,8 +534,14 @@ begin
           mul_a <= signed(coeff_b);
           mul_b <= zeta_val;
         end if;
-      when S_M2 => -- mul2: low(x*y) * QINV
-        if (mode = '0') then
+      when S_M2 => -- mul2: low(x*y) * QINV  |  Barrett: t * q
+        if (red = '1') then
+          -- t = (magic*a + 2^25) >> 26 ; the shift is by a CONSTANT, so it is wiring.
+          -- Only the low 32 bits of p1 are needed (magic*|a| < 2^30), and the library
+          -- computes the whole thing in int32, so this reproduces its overflow-free path.
+          mul_a <= shift_right(resize(signed(p1(31 downto 0)), 32) + to_signed(33554432, 32), 26);
+          mul_b <= to_signed(kem_q_c, 32);
+        elsif (mode = '0') then
           mul_a <= signed(resize(unsigned(p1(15 downto 0)), 32));
           mul_b <= to_signed(kem_qinv_c, 32);
         else
@@ -517,7 +549,11 @@ begin
           mul_b <= to_signed(dsa_qinv_c, 32);
         end if;
       when S_M3 => -- mul3: t * q
-        if (mode = '0') then
+        if (red = '1') then
+          -- the t*q product was already formed in S_M2 and registered in red_p_r
+          mul_a <= (others => '0');
+          mul_b <= (others => '0');
+        elsif (mode = '0') then
           mul_a <= resize(signed(m_red(15 downto 0)), 32);
           mul_b <= to_signed(kem_q_c, 32);
         else
@@ -538,6 +574,18 @@ begin
 
   rm_r <= resize(signed(red64_r(15 downto 0)), 32) when (mode = '0') else red64_r(31 downto 0);
   rm_r_v <= std_ulogic_vector(rm_r);
+
+  -- Barrett reduce (REDUCE op). The library's mlk_barrett_reduce() computes
+  --     res = (int16_t)(a - t * MLKEM_Q)
+  -- - the int16 cast happens INSIDE the reduction - and mlk_poly_reduce_c() then
+  -- applies mlk_scalar_signed_to_unsigned_q(), which is exactly "add q if negative".
+  -- The cast therefore has to happen BEFORE the conditional add, otherwise the two
+  -- disagree for inputs whose difference leaves the int16 range (the library
+  -- truncates there, we would not).
+  red_dif <= red_a_r - red_p_r;
+  red_tr  <= red_dif(15 downto 0);
+  red_res <= resize(red_tr, 32) when (red_tr(15) = '0') else
+             resize(red_tr, 32) + to_signed(kem_q_c, 32);
 
   -- ML-KEM stores int16 coefficients, so the butterfly add/sub is truncated to 16 bits just
   -- like the C reference. ML-DSA is int32 throughout and wraps naturally at 32 bits.
@@ -578,6 +626,9 @@ begin
       qb_r    <= (others => '0');
       inv     <= '0';
       scl     <= '0';
+      red     <= '0';
+      red_a_r <= (others => '0');
+      red_p_r <= (others => '0');
       sc_w    <= (others => '0');
       waddr   <= bo_zero_c;
       done    <= '0';
@@ -665,6 +716,17 @@ begin
                 ptr_bo  <= ptr128_b;
                 coeff_a <= d_a;                  -- the word at ptr (stream read)
                 state   <= S_M1;
+              when sub_reduce_c =>
+                -- Barrett-reduce the 128 coefficients at ptr (two ops cover one poly)
+                inv     <= '0';
+                scl     <= '0';
+                red     <= '1';
+                sc_w    <= (others => '0');
+                waddr   <= ptr_bo;               -- first word's address
+                ptr     <= ptr128;               -- ptr := ptr + 128
+                ptr_bo  <= ptr128_b;
+                coeff_a <= d_a;                  -- the word at ptr (stream read)
+                state   <= S_M1;
               when others =>
                 null;
             end case;
@@ -683,25 +745,37 @@ begin
         when S_M1 =>
           p1      <= resize(mul_p, 64);
           wr_pend <= '0';
+          if (red = '1') then
+            red_a_r <= signed(coeff_a);        -- keep 'a' for the final subtraction
+          end if;
           if (last_bf = '1') then
             state   <= S_IDLE;
             done    <= '1';
             last_bf <= '0';
             scl     <= '0';
             inv     <= '0';
+            red     <= '0';
           else
             state <= S_M2;
           end if;
 
         -- mul2: low(x*y) * QINV ----------------------------------------------------------
         when S_M2 =>
-          m_red <= unsigned(resize(mul_p, 64));
+          if (red = '1') then
+            red_p_r <= resize(mul_p, 32);      -- t * q
+          else
+            m_red <= unsigned(resize(mul_p, 64));
+          end if;
           state <= S_M3;
 
         -- mul3 + reduce (registered); remember write info; prefetch the NEXT butterfly -----
         when S_M3 =>
-          red64_r <= red64_c;
-          if (scl = '1') then
+          if (red = '1') then
+            red64_r <= resize(red_res, 64);   -- the Barrett result
+          else
+            red64_r <= red64_c;
+          end if;
+          if ((scl = '1') or (red = '1')) then
             -- SCALE: the reduce result is the scaled coefficient; latch the write info
             -- and prefetch the next word (read issued this cycle)
             wra_r   <= waddr;
@@ -775,7 +849,7 @@ begin
           else
             valid_o <= '0';
           end if;
-        when sub_clear_c | sub_layer_c | sub_scale_c | sub_layeri_c =>
+        when sub_clear_c | sub_layer_c | sub_scale_c | sub_layeri_c | sub_reduce_c =>
           valid_o <= done;
         when others =>
           valid_o <= '0'; -- unsupported sub-op
