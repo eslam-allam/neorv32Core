@@ -5,6 +5,7 @@
 --
 --   funct3 = 000..101 : Keccak-f1600 engine (see neorv32_cpu_alu_cfu_keccak*.vhd)
 --   funct3 = 110      : NTT engine        (see neorv32_cpu_alu_cfu_ntt.vhd)
+--   funct3 = 111      : rejection sampler (see neorv32_cpu_alu_cfu_rej.vhd)
 --
 -- The Keccak engine exists in two generations and the generic CFU_KECCAK_GEN
 -- selects which one is elaborated:
@@ -60,12 +61,15 @@ architecture neorv32_cpu_alu_cfu_rtl of neorv32_cpu_alu_cfu is
 
   -- engine select --
   constant cfu_ntt_c : std_ulogic_vector(2 downto 0) := "110"; -- NTT engine select
+  constant cfu_rej_c : std_ulogic_vector(2 downto 0) := "111"; -- rejection-sampling engine
 
   -- accelerator engines: one CFU slot, several engines selected by funct3 --
   signal keccak_result_o : std_ulogic_vector(31 downto 0);
   signal keccak_valid_o  : std_ulogic;
   signal ntt_result_o    : std_ulogic_vector(31 downto 0);
   signal ntt_valid_o     : std_ulogic;
+  signal rej_result_o    : std_ulogic_vector(31 downto 0);
+  signal rej_valid_o     : std_ulogic;
   signal funct3          : std_ulogic_vector(2 downto 0);
 
 begin
@@ -114,8 +118,23 @@ begin
     valid_o  => ntt_valid_o
   );
 
+  -- Rejection-Sampling Engine (stdlib sub-unit; consumes funct3 = 111) -----------------------
+  rej_engine: entity neorv32.neorv32_cpu_alu_cfu_rej
+  port map (
+    clk_i    => clk_i,
+    rstn_i   => rstn_i,
+    start_i  => start_i,
+    inst_i   => inst_i,
+    rs1_i    => rs1_i,
+    rs2_i    => rs2_i,
+    result_o => rej_result_o,
+    valid_o  => rej_valid_o
+  );
+
   -- Response mux: the engine addressed by funct3 owns the CFU response ----------------------
-  result_o <= ntt_result_o when (funct3 = cfu_ntt_c) else keccak_result_o;
-  valid_o  <= ntt_valid_o  when (funct3 = cfu_ntt_c) else keccak_valid_o;
+  result_o <= ntt_result_o when (funct3 = cfu_ntt_c) else
+              rej_result_o when (funct3 = cfu_rej_c) else keccak_result_o;
+  valid_o  <= ntt_valid_o  when (funct3 = cfu_ntt_c) else
+              rej_valid_o  when (funct3 = cfu_rej_c) else keccak_valid_o;
 
 end neorv32_cpu_alu_cfu_rtl;
