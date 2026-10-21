@@ -166,6 +166,7 @@ architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
   constant sub_layeri_c : std_ulogic_vector(6 downto 0) := "0000111";
   constant sub_reduce_c : std_ulogic_vector(6 downto 0) := "0001000";
   constant sub_tomont_c : std_ulogic_vector(6 downto 0) := "0001001";
+  constant sub_mulcache_c : std_ulogic_vector(6 downto 0) := "0001010";
 
   -- ML-KEM modulus parameters (q = 3329, R = 2^16) --
   constant kem_q_c     : integer := 3329;
@@ -333,6 +334,10 @@ architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
   signal scl   : std_ulogic;               -- current op is SCALE
   signal red   : std_ulogic;               -- current op is REDUCE (Barrett)
   signal tom   : std_ulogic;               -- current op is TOMONT (Montgomery conversion)
+  signal mulc  : std_ulogic;               -- current op is MULCACHE (multiplication cache)
+  signal mulc_odd : std_ulogic;            -- MULCACHE: the odd pass (negated twiddle)
+  signal mc_idx : unsigned(6 downto 0);     -- MULCACHE: the twiddle ROM index (64 + i)
+  signal mc_zeta : signed(31 downto 0);    -- MULCACHE: the signed twiddle
   signal red_a_r : signed(31 downto 0);     -- REDUCE: the coefficient being reduced
   signal red_p_r : signed(31 downto 0);     -- REDUCE: t * q
   signal red_dif : signed(31 downto 0);     -- REDUCE: a - t*q (32-bit)
@@ -380,6 +385,18 @@ begin
   len_inv_b <= bo_of(len_inv);
   nblk_inv  <= shift_left(to_unsigned(1, nblk'length), to_integer(nlay - layer));
   zeta_eff  <= zeta_val when ((mode = '0') or (inv = '0')) else -zeta_val;
+
+  -- The MULCACHE op reads the twiddle ROM through its own index (64 + i) and
+  -- needs the NEGATED value for the odd pass. A second read port on the ROM
+  -- costs a few tens of LUT (the ROM is a constant array) and keeps the
+  -- multiplier's B-operand select unchanged.
+  -- NOTE: the ML-KEM ROM is read with a 7-bit index (128 entries), so the
+  -- mulcache's index 64..127 fits exactly - an 8-bit index would wrap.
+  -- (This is a CONCURRENT conditional assignment: the design is read as
+  -- VHDL-93, where a conditional expression inside a process is not legal.)
+  mc_zeta <= to_signed(-zetas_kem_c(to_integer(mc_idx)), 32) when (mode = '0') and (mulc_odd = '1') else
+             to_signed(zetas_kem_c(to_integer(mc_idx)), 32) when (mode = '0') else
+             to_signed(zetas_dsa_c(to_integer(mc_idx)), 32);
   f_scale   <= to_signed(kem_fscale_c, 32) when (mode = '0') else to_signed(dsa_fscale_c, 32);
   dif_pre   <= signed(d_b) - signed(d_a) when (mode = '0') else signed(d_a) - signed(d_b);
   sum_inv   <= signed(qa_r) + signed(qb_r);
@@ -387,8 +404,11 @@ begin
               when (mode = '0') else std_ulogic_vector(sum_inv);
   ptr128    <= ptr + 128;
   ptr128_b  <= bo_of(ptr + 128);
-  sc_nxt_w  <= bo_add(waddr, bo_one_c); -- both modes: one coefficient per word
-  sc_last   <= to_unsigned(127, sc_last'length); -- 128 words per SCALE op
+  -- The MULCACHE walks the slots with a STRIDE OF 2 (its pairs are adjacent
+  -- compacted slots); the scale walks them one at a time.
+  sc_nxt_w  <= bo_add(waddr, bo_two_c) when (mulc = '1') else bo_add(waddr, bo_one_c);
+  sc_last   <= to_unsigned(63, sc_last'length) when (mulc = '1') else
+                to_unsigned(127, sc_last'length); -- 128 words per SCALE op, 64 per MULCACHE
   is_last   <= '1' when (jj = len - 1) and (blk = nblk - 1) else '0';
 
   -- Twiddle Factor Select -------------------------------------------------------------------
@@ -418,8 +438,8 @@ begin
   rd_sel_proc: process(state, start, subop, is_last, cur_a, cur_b, nxt_a, nxt_b, ptr_bo,
                        len_nxt_b, scl, red, sc_nxt_w, len_inv_b)
   begin
-    if (state = S_M3) and ((scl = '1') or (red = '1')) then
-      rd_a <= sc_nxt_w;                    -- SCALE / REDUCE: prefetch the next word
+    if (state = S_M3) and ((scl = '1') or (red = '1') or (mulc = '1')) then
+      rd_a <= sc_nxt_w;                    -- SCALE / REDUCE / MULCACHE: prefetch the next word
       rd_b <= bo_add(sc_nxt_w, bo_one_c);
     elsif (state = S_M3) then
       if (is_last = '0') then
@@ -476,9 +496,10 @@ begin
                       ((state = S_IDLE) and (start = '1') and (subop = sub_write_c)) else '0';
   -- SCALE writes only slot 0 (one coefficient per word); butterflies and the inverse
   -- layer write both slots.
-  wr1_en <= '1' when ((state = S_M1) and (wr_pend = '1') and (scl = '0') and (red = '0')) or
+  wr1_en <= '1' when ((state = S_M1) and (wr_pend = '1') and (scl = '0') and
+                      (red = '0') and (mulc = '0')) or
                      ((state = S_IDLE) and (start = '1') and (subop = sub_write_c) and (mode = '0')) else '0';
-  wr0_data <= rm_r_v when ((state = S_M1) and ((scl = '1') or (red = '1'))) else -- SCALE / REDUCE
+  wr0_data <= rm_r_v when ((state = S_M1) and ((scl = '1') or (red = '1') or (mulc = '1'))) else -- SCALE / REDUCE / MULCACHE
               inv0_v when ((state = S_M1) and (inv = '1')) else -- inverse a' (Barrett/plain)
               sum_v  when (state = S_M1) else
               std_ulogic_vector(resize(signed(rs1_i(15 downto 0)), 32)) when ((subop = sub_write_c) and (mode = '0')) else
@@ -522,8 +543,8 @@ begin
   -- Shared Multiplier Operand Select ---------------------------------------------------------
   -- Only REGISTERED values may reach the multiplier; a combinational LUTRAM read here would
   -- create a false read -> mul1 -> reduce -> write path that spans the whole pipeline.
-  mul_proc: process(state, mode, scl, inv, red, tom, coeff_a, coeff_b, coeff_d, p1,
-                    m_red, zeta_val, zeta_eff, f_scale)
+  mul_proc: process(state, mode, scl, inv, red, tom, mulc, coeff_a, coeff_b, coeff_d,
+                    p1, m_red, zeta_val, zeta_eff, f_scale, mc_zeta)
   begin
     mul_a <= (others => '0');
     mul_b <= (others => '0');
@@ -543,6 +564,9 @@ begin
           else
             mul_b <= f_scale;       -- the mode's constant
           end if;
+        elsif (mulc = '1') then -- MULCACHE: coefficient * twiddle
+          mul_a <= signed(coeff_a);
+          mul_b <= mc_zeta;         -- the ROM's twiddle, signed for this pass
         elsif (red = '1') then -- Barrett: a * magic
           mul_a <= signed(coeff_a);
           mul_b <= to_signed(kem_barrett_magic_c, 32);
@@ -644,6 +668,9 @@ begin
       scl     <= '0';
       red     <= '0';
       tom     <= '0';
+      mulc    <= '0';
+      mulc_odd <= '0';
+      mc_idx  <= (others => '0');
       red_a_r <= (others => '0');
       red_p_r <= (others => '0');
       sc_w    <= (others => '0');
@@ -746,6 +773,24 @@ begin
                 ptr_bo  <= ptr128_b;
                 coeff_a <= d_a;                  -- the word at ptr (stream read)
                 state   <= S_M1;
+              when sub_mulcache_c =>
+                -- Multiplication cache: multiply the slots at ptr (stride 2) by
+                -- +/- zeta[64+i] and write the result back in place. rs1[0] selects
+                -- the pass: 0 = the even slots (+zeta), 1 = the odd slots (-zeta).
+                -- The compacted layout the software pushes makes the compacted
+                -- output order identical to the library's cache layout.
+                inv     <= '0';
+                scl     <= '0';
+                tom     <= '0';
+                mulc    <= '1';
+                mulc_odd <= rs1_i(0);
+                mc_idx  <= to_unsigned(64, mc_idx'length);
+                sc_w    <= (others => '0');
+                waddr   <= ptr_bo;         -- the base slot is the pointer itself
+                ptr     <= ptr128;               -- ptr := ptr + 128
+                ptr_bo  <= ptr128_b;
+                coeff_a <= d_a;                  -- the word at ptr (stream read)
+                state   <= S_M1;
               when sub_reduce_c =>
                 -- Barrett-reduce the 128 coefficients at ptr (two ops cover one poly)
                 inv     <= '0';
@@ -786,6 +831,7 @@ begin
             inv     <= '0';
             red     <= '0';
             tom     <= '0';
+            mulc    <= '0';
           else
             state <= S_M2;
           end if;
@@ -806,7 +852,7 @@ begin
           else
             red64_r <= red64_c;
           end if;
-          if ((scl = '1') or (red = '1')) then
+          if ((scl = '1') or (red = '1') or (mulc = '1')) then
             -- SCALE: the reduce result is the scaled coefficient; latch the write info
             -- and prefetch the next word (read issued this cycle)
             wra_r   <= waddr;
@@ -818,6 +864,9 @@ begin
               sc_w    <= sc_w + 1;
               waddr   <= sc_nxt_w;
               coeff_a <= d_a;
+              if (mulc = '1') then
+                mc_idx <= mc_idx + 1;    -- the next twiddle (64 + i)
+              end if;
               state   <= S_M1;
             end if;
           else
@@ -881,7 +930,7 @@ begin
             valid_o <= '0';
           end if;
         when sub_clear_c | sub_layer_c | sub_scale_c | sub_layeri_c | sub_reduce_c |
-             sub_tomont_c =>
+             sub_tomont_c | sub_mulcache_c =>
           valid_o <= done;
         when others =>
           valid_o <= '0'; -- unsupported sub-op
