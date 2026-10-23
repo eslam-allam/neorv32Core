@@ -71,6 +71,7 @@ entity neorv32_cpu is
     PMP_TOR_MODE_EN     : boolean;                        -- enable TOR mode
     PMP_NAP_MODE_EN     : boolean;                        -- enable NAPOT/NA4 modes
     -- Hardware Performance Monitors (HPM) --
+    CPU_CFU_NTT_EN    : boolean := true;          -- enable NTT CFU engine (forward/inverse NTT + arithmetic ops)
     HPM_NUM_CNTS        : natural range 0 to 29;          -- number of implemented HPM counters
     HPM_CNT_WIDTH       : natural range 0 to 64;          -- total size of HPM counters
     -- Trigger Module (TM) --

@@ -4,8 +4,9 @@
 -- One CFU co-processor slot, several engines selected by funct3:
 --
 --   funct3 = 000..101 : Keccak-f1600 engine (see neorv32_cpu_alu_cfu_keccak*.vhd)
---   funct3 = 110      : NTT engine        (see neorv32_cpu_alu_cfu_ntt.vhd)
---   funct3 = 111      : rejection sampler (see neorv32_cpu_alu_cfu_rej.vhd)
+--   funct3 = 010      : NTT engine        (see neorv32_cpu_alu_cfu_ntt.vhd)
+--   funct3 = 011      : rejection sampler (see neorv32_cpu_alu_cfu_rej.vhd)
+--   funct3 = 100..111 : reserved for future engines
 --
 -- The Keccak engine exists in two generations and the generic CFU_KECCAK_GEN
 -- selects which one is elaborated:
@@ -17,10 +18,7 @@
 --        A PERM op advances exactly ONE round (~487 cycles), so a permutation is
 --        24 ops. Area: 678 LUT / 503 FF.
 --
--- The two generations have different op granularity, so the software wrapper
--- (neorv32.sw/projects/user_libs/cfu_keccak.h) has to match the selected
--- generation: one PERM op for gen 1, 24 for gen 2. The board top-level generic
--- is threaded down to here unchanged.
+-- The NTT engine is optional and controlled by CPU_CFU_NTT_EN.
 --
 -- The NEORV32 RISC-V Processor - https://github.com/stnolting/neorv32                --
 -- Copyright (c) NEORV32 contributors.                                                --
@@ -40,7 +38,10 @@ entity neorv32_cpu_alu_cfu is
   generic (
     -- Keccak engine generation: 1 = wide (1 PERM op = whole permutation),
     -- 2 = serialized (1 PERM op = 1 round). Must match the software wrapper.
-    CFU_KECCAK_GEN : natural := 2
+    CFU_KECCAK_GEN : natural := 2;
+    -- NTT engine enable: when false, the NTT engine is not instantiated and
+    -- funct3=010 is treated as illegal instruction.
+    CPU_CFU_NTT_EN : boolean := true
   );
   port (
     -- global control --
@@ -60,8 +61,9 @@ end neorv32_cpu_alu_cfu;
 architecture neorv32_cpu_alu_cfu_rtl of neorv32_cpu_alu_cfu is
 
   -- engine select --
-  constant cfu_ntt_c : std_ulogic_vector(2 downto 0) := "110"; -- NTT engine select
-  constant cfu_rej_c : std_ulogic_vector(2 downto 0) := "111"; -- rejection-sampling engine
+  constant cfu_keccak_c : std_ulogic_vector(2 downto 0) := "000"; -- Keccak base (000..101)
+  constant cfu_ntt_c    : std_ulogic_vector(2 downto 0) := "010"; -- NTT engine
+  constant cfu_rej_c    : std_ulogic_vector(2 downto 0) := "011"; -- rejection-sampling engine
 
   -- accelerator engines: one CFU slot, several engines selected by funct3 --
   signal keccak_result_o : std_ulogic_vector(31 downto 0);
@@ -105,36 +107,43 @@ begin
       );
   end generate;
 
-  -- NTT Engine (stdlib sub-unit; consumes funct3 = 110) ------------------------------------
-  ntt_engine: entity neorv32.neorv32_cpu_alu_cfu_ntt
-  port map (
-    clk_i    => clk_i,
-    rstn_i   => rstn_i,
-    start_i  => start_i,
-    inst_i   => inst_i,
-    rs1_i    => rs1_i,
-    rs2_i    => rs2_i,
-    result_o => ntt_result_o,
-    valid_o  => ntt_valid_o
-  );
+  -- NTT Engine (stdlib sub-unit; consumes funct3 = 010) ------------------------------------
+  u_ntt: if CPU_CFU_NTT_EN generate
+    ntt_engine: entity neorv32.neorv32_cpu_alu_cfu_ntt
+      port map (
+        clk_i    => clk_i,
+        rstn_i   => rstn_i,
+        start_i  => start_i,
+        inst_i   => inst_i,
+        rs1_i    => rs1_i,
+        rs2_i    => rs2_i,
+        result_o => ntt_result_o,
+        valid_o  => ntt_valid_o
+      );
+  end generate;
 
-  -- Rejection-Sampling Engine (stdlib sub-unit; consumes funct3 = 111) -----------------------
+  -- Rejection-Sampling Engine (stdlib sub-unit; consumes funct3 = 011) -----------------------
   rej_engine: entity neorv32.neorv32_cpu_alu_cfu_rej
-  port map (
-    clk_i    => clk_i,
-    rstn_i   => rstn_i,
-    start_i  => start_i,
-    inst_i   => inst_i,
-    rs1_i    => rs1_i,
-    rs2_i    => rs2_i,
-    result_o => rej_result_o,
-    valid_o  => rej_valid_o
-  );
+    port map (
+      clk_i    => clk_i,
+      rstn_i   => rstn_i,
+      start_i  => start_i,
+      inst_i   => inst_i,
+      rs1_i    => rs1_i,
+      rs2_i    => rs2_i,
+      result_o => rej_result_o,
+      valid_o  => rej_valid_o
+    );
 
   -- Response mux: the engine addressed by funct3 owns the CFU response ----------------------
-  result_o <= ntt_result_o when (funct3 = cfu_ntt_c) else
-              rej_result_o when (funct3 = cfu_rej_c) else keccak_result_o;
-  valid_o  <= ntt_valid_o  when (funct3 = cfu_ntt_c) else
-              rej_valid_o  when (funct3 = cfu_rej_c) else keccak_valid_o;
+  -- funct3 mapping:
+  --   000..101 : Keccak-f1600 (7 opcodes)
+  --   010      : NTT engine (8 sub-ops via funct7)
+  --   011      : Rejection sampling (8 sub-ops via funct7)
+  --   100..111 : reserved
+  result_o <= ntt_result_o when (CPU_CFU_NTT_EN and funct3 = "010") else
+              rej_result_o when (funct3 = "011") else keccak_result_o;
+  valid_o  <= ntt_valid_o  when (CPU_CFU_NTT_EN and funct3 = "010") else
+              rej_valid_o  when (funct3 = "011") else keccak_valid_o;
 
 end neorv32_cpu_alu_cfu_rtl;
