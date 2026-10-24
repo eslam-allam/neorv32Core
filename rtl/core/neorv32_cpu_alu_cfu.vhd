@@ -44,7 +44,10 @@ entity neorv32_cpu_alu_cfu is
     CFU_KECCAK_GEN : natural := 2;
     -- NTT engine enable: when false, the NTT engine is not instantiated and
     -- funct3=110 is treated as illegal instruction.
-    CPU_CFU_NTT_EN : boolean := true
+    CPU_CFU_NTT_EN : boolean := true;
+    -- NTT multiplier implementation: true = use DSP48E1 (Xilinx 7-series),
+    -- false = behavioral multiplier (tool decides: LUTs or inferred DSP)
+    CPU_CFU_NTT_USE_DSP : boolean := false
   );
   port (
     -- global control --
@@ -113,6 +116,9 @@ begin
   -- NTT Engine (stdlib sub-unit; consumes funct3 = 110) ------------------------------------
   u_ntt: if CPU_CFU_NTT_EN generate
     ntt_engine: entity neorv32.neorv32_cpu_alu_cfu_ntt
+      generic map (
+        USE_DSP => CPU_CFU_NTT_USE_DSP
+      )
       port map (
         clk_i    => clk_i,
         rstn_i   => rstn_i,

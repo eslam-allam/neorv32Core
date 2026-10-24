@@ -134,6 +134,11 @@ use neorv32.neorv32_package.all;
 use neorv32.neorv32_cpu_alu_cfu_ntt_zetas.all;
 
 entity neorv32_cpu_alu_cfu_ntt is
+  generic (
+    -- Multiplier implementation style: true = use DSP48E1 (Xilinx 7-series),
+    -- false = behavioral multiplier (tool decides: LUTs or inferred DSP)
+    USE_DSP : boolean := false
+  );
   port (
     -- global control --
     clk_i    : in  std_ulogic; -- global clock, rising edge
@@ -150,6 +155,11 @@ entity neorv32_cpu_alu_cfu_ntt is
 end neorv32_cpu_alu_cfu_ntt;
 
 architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
+
+  -- Multiplier implementation style (from generic) --
+  -- USE_DSP = true  : instantiate DSP48E1 primitive (Xilinx 7-series)
+  -- USE_DSP = false : behavioral multiplier (tool decides: LUTs or inferred DSP)
+  -- This generic is threaded from the top level through the CFU dispatcher.
 
   -- instruction decode --
   constant opcode_custom0_c : std_ulogic_vector(6 downto 0) := "0001011"; -- CUSTOM-0 opcode
@@ -304,27 +314,27 @@ architecture neorv32_cpu_alu_cfu_ntt_rtl of neorv32_cpu_alu_cfu_ntt is
   signal wr0_data, wr1_data : std_ulogic_vector(31 downto 0);
   signal rm_r_v : std_ulogic_vector(31 downto 0); -- rm_r as a write-data vector
 
-  -- shared multiplier (LUT-only by design: no DSP inference) --
-  signal mul_a, mul_b : signed(31 downto 0);
-  -- The multiplier is only 32 x 27: every B operand of every multiply fits in a
-  -- 27-bit SIGNED value (the widest is ML-DSA mul2 with B = QINV = 58728449 < 2^26),
-  -- so truncating mul_b to 27 bits is exact. Single-pass, so no B-halving FSM and no
-  -- cycle cost: both modes keep the 3-cycle butterfly. Measured in the full design,
-  -- this narrows the engine 2365 -> 2286 LUT and the critical path 2.81 -> 3.77 ns.
-  signal mul_p        : signed(58 downto 0); -- combinational product (32 x 27)
-  attribute use_dsp : string;
-  attribute use_dsp of mul_p : signal is "no";
+  -- shared multiplier (abstraction: behavioral or DSP48E1 via generic USE_DSP) --
+  -- The NTT engine uses a 32x27 signed multiplier in a 3-cycle pipeline:
+  --   S_M1: mul1 = a * b          -> p1 (registered)
+  --   S_M2: mul2 = low(p1) * QINV -> m_red (registered)
+  --   S_M3: mul3 = m_red * q      -> red64_c (registered)
+  -- The multiplier is combinational in both variants: each product is consumed
+  -- on the next clock edge by the state machine.
+  signal mul_a        : signed(31 downto 0);  -- operand A (32-bit signed)
+  signal mul_b        : signed(26 downto 0);  -- operand B (27-bit signed)
+  signal mul_res      : signed(58 downto 0);  -- product (59-bit signed)
+
+  -- Internal pipeline registers for the 3-cycle Montgomery chain --
+  signal p1           : signed(63 downto 0);  -- mul1: x * y (64-bit signed product)
+  signal m_red        : unsigned(63 downto 0); -- mul2: low(x*y) * QINV
+  signal red64_c      : signed(63 downto 0);  -- (x*y - t*q) >> shift (combinational)
+  signal red64_r      : signed(63 downto 0);  -- registered reduction result
 
   -- butterfly datapath registers (multiplier operands are ALWAYS registered) --
   signal coeff_a : std_ulogic_vector(31 downto 0); -- 'a' operand of the current butterfly
   signal coeff_b : std_ulogic_vector(31 downto 0); -- 'b' operand of the current butterfly
   signal coeff_d : std_ulogic_vector(31 downto 0); -- inverse: registered (b-a)/(a-b) of the current butterfly
-  signal p1      : signed(63 downto 0);            -- mul1: x * y (64-bit signed product)
-  signal m_red   : unsigned(63 downto 0);          -- mul2: low(x*y) * QINV
-
-  -- deferred-write registers (break the multiplier -> write false path) --
-  signal red64_c : signed(63 downto 0);            -- (x*y - t*q) >> shift (combinational)
-  signal red64_r : signed(63 downto 0);            -- registered reduction result
   signal qa_r    : std_ulogic_vector(31 downto 0); -- this butterfly's 'a', kept for +/- t
   signal wra_r   : bo_t;                           -- deferred write address (a')
   signal wrb_r   : bo_t;                           -- deferred write address (b')
@@ -546,8 +556,8 @@ begin
   mul_proc: process(state, mode, scl, inv, red, tom, mulc, coeff_a, coeff_b, coeff_d,
                     p1, m_red, zeta_val, zeta_eff, f_scale, mc_zeta)
   begin
-    mul_a <= (others => '0');
-    mul_b <= (others => '0');
+    mul_a   <= (others => '0');
+    mul_b   <= (others => '0');
     case state is
       when S_M1 => -- mul1: coefficient*twiddle | inverse difference*twiddle | scale | barrett
         -- NOTE: the ORDER of these tests is timing-critical. The design's limiting
@@ -556,23 +566,23 @@ begin
         -- other test in front of it would add a mux level to that path.
         if (inv = '1') then -- inverse butterfly: (b-a)/(a-b) * twiddle
           mul_a <= signed(coeff_d);
-          mul_b <= zeta_eff;
+          mul_b <= zeta_eff(26 downto 0);
         elsif (scl = '1') then
           mul_a <= signed(coeff_a); -- one full word = one coefficient (both modes)
           if (tom = '1') then
-            mul_b <= to_signed(kem_tomont_c, 32); -- the Montgomery-conversion constant
+            mul_b <= to_signed(kem_tomont_c, 27); -- the Montgomery-conversion constant
           else
-            mul_b <= f_scale;       -- the mode's constant
+            mul_b <= f_scale(26 downto 0);       -- the mode's constant
           end if;
         elsif (mulc = '1') then -- MULCACHE: coefficient * twiddle
           mul_a <= signed(coeff_a);
-          mul_b <= mc_zeta;         -- the ROM's twiddle, signed for this pass
+          mul_b <= mc_zeta(26 downto 0);         -- the ROM's twiddle, signed for this pass
         elsif (red = '1') then -- Barrett: a * magic
           mul_a <= signed(coeff_a);
-          mul_b <= to_signed(kem_barrett_magic_c, 32);
+          mul_b <= to_signed(kem_barrett_magic_c, 27);
         else
           mul_a <= signed(coeff_b);
-          mul_b <= zeta_val;
+          mul_b <= zeta_val(26 downto 0);
         end if;
       when S_M2 => -- mul2: low(x*y) * QINV  |  Barrett: t * q
         if (red = '1') then
@@ -580,13 +590,13 @@ begin
           -- Only the low 32 bits of p1 are needed (magic*|a| < 2^30), and the library
           -- computes the whole thing in int32, so this reproduces its overflow-free path.
           mul_a <= shift_right(resize(signed(p1(31 downto 0)), 32) + to_signed(33554432, 32), 26);
-          mul_b <= to_signed(kem_q_c, 32);
+          mul_b <= to_signed(kem_q_c, 27);
         elsif (mode = '0') then
           mul_a <= signed(resize(unsigned(p1(15 downto 0)), 32));
-          mul_b <= to_signed(kem_qinv_c, 32);
+          mul_b <= to_signed(kem_qinv_c, 27);
         else
           mul_a <= p1(31 downto 0);
-          mul_b <= to_signed(dsa_qinv_c, 32);
+          mul_b <= to_signed(dsa_qinv_c, 27);
         end if;
       when S_M3 => -- mul3: t * q
         if (red = '1') then
@@ -595,22 +605,34 @@ begin
           mul_b <= (others => '0');
         elsif (mode = '0') then
           mul_a <= resize(signed(m_red(15 downto 0)), 32);
-          mul_b <= to_signed(kem_q_c, 32);
+          mul_b <= to_signed(kem_q_c, 27);
         else
           mul_a <= signed(m_red(31 downto 0));
-          mul_b <= to_signed(dsa_q_c, 32);
+          mul_b <= to_signed(dsa_q_c, 27);
         end if;
+
       when others =>
         null;
-    end case;
-  end process mul_proc;
-  mul_p <= mul_a * mul_b(26 downto 0); -- 32 x 27 -> 59-bit signed product
+      end case;
+    end process mul_proc;
+  -- Multiplier Primitive Instance (32x27 signed, combinational) -----------------------------
+  -- USE_DSP generic selects between behavioral (LUT) and DSP48E1 implementation; both
+  -- return the product in the same cycle, as required by the S_M1/S_M2/S_M3 chain.
+  mul_prim_inst: entity neorv32.neorv32_prim_mul_ntt
+    generic map (
+      USE_DSP => USE_DSP
+    )
+    port map (
+      a_i    => mul_a,
+      b_i    => mul_b,
+      res_o  => mul_res
+    );
 
   -- Montgomery Reduction (combinational product, REGISTERED result) --------------------------
   -- red64 = (x*y - t*q) >> shift ; the register is what keeps the multiplier output off the
   -- scratchpad write-data path.
-  red64_c <= shift_right(p1 - resize(mul_p, 64), kem_shift_c) when (mode = '0') else
-             shift_right(p1 - resize(mul_p, 64), dsa_shift_c);
+  red64_c <= shift_right(p1 - resize(mul_res, 64), kem_shift_c) when (mode = '0') else
+             shift_right(p1 - resize(mul_res, 64), dsa_shift_c);
 
   rm_r <= resize(signed(red64_r(15 downto 0)), 32) when (mode = '0') else red64_r(31 downto 0);
   rm_r_v <= std_ulogic_vector(rm_r);
@@ -818,7 +840,7 @@ begin
 
         -- mul1: x*y, plus the deferred write of the previous butterfly (if any) ------------
         when S_M1 =>
-          p1      <= resize(mul_p, 64);
+          p1      <= resize(mul_res, 64);
           wr_pend <= '0';
           if (red = '1') then
             red_a_r <= signed(coeff_a);        -- keep 'a' for the final subtraction
@@ -839,9 +861,9 @@ begin
         -- mul2: low(x*y) * QINV ----------------------------------------------------------
         when S_M2 =>
           if (red = '1') then
-            red_p_r <= resize(mul_p, 32);      -- t * q
+            red_p_r <= resize(mul_res, 32);      -- t * q
           else
-            m_red <= unsigned(resize(mul_p, 64));
+            m_red <= unsigned(resize(mul_res, 64));
           end if;
           state <= S_M3;
 
