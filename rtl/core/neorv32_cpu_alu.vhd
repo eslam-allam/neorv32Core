@@ -40,7 +40,8 @@ entity neorv32_cpu_alu is
     FAST_MUL_EN      : boolean; -- use DSPs for M extension's multiplier
     FAST_SHIFT_EN    : boolean; -- use barrel shifter for shift operations
     -- CFU tuning --
-    CFU_KECCAK_GEN   : natural := 2 -- Keccak CFU engine generation (1 = wide, 2 = serialized)
+    CFU_KECCAK_GEN      : natural := 2; -- Keccak CFU engine generation (1 = wide, 2 = serialized)
+    CPU_CFU_NTT_USE_DSP : boolean := false -- NTT CFU multiplier: true = DSP48E1, false = behavioral
   );
   port (
     -- global control --
@@ -276,7 +277,8 @@ begin
   if RISCV_ISA_Xcfu generate
     neorv32_cpu_alu_cfu_inst: entity neorv32.neorv32_cpu_alu_cfu
     generic map (
-      CFU_KECCAK_GEN => CFU_KECCAK_GEN
+      CFU_KECCAK_GEN      => CFU_KECCAK_GEN,
+      CPU_CFU_NTT_USE_DSP => CPU_CFU_NTT_USE_DSP
     )
     port map (
       -- global control --
