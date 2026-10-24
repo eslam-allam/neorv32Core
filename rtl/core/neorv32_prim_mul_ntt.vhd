@@ -52,6 +52,9 @@ architecture neorv32_prim_mul_ntt_rtl of neorv32_prim_mul_ntt is
       PREG               : integer := 1;
       SEL_MASK           : string  := "MASK";
       SEL_PATTERN        : string  := "PATTERN";
+      -- NOTE: USE_DPORT is a string (not the boolean used by the VHDL
+      -- template) so the mixed-language xsim flow passes "FALSE" to the
+      -- Verilog unisim model; synthesis accepts the same value.
       USE_DPORT          : string  := "FALSE";
       USE_MULT           : string  := "MULTIPLY";
       USE_PATTERN_DETECT : string  := "NO_PATDET";
