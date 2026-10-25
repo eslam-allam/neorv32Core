@@ -41,7 +41,10 @@ entity neorv32_cpu_alu is
     FAST_SHIFT_EN    : boolean; -- use barrel shifter for shift operations
     -- CFU tuning --
     CFU_KECCAK_GEN      : natural := 2; -- Keccak CFU engine generation (1 = wide, 2 = serialized)
-    CPU_CFU_NTT_USE_DSP : boolean := false -- NTT CFU multiplier: true = DSP48E1, false = behavioral
+    CPU_CFU_KECCAK_EN   : boolean := true; -- enable Keccak CFU engine (funct3 = 000..101)
+    CPU_CFU_NTT_EN      : boolean := true; -- enable NTT CFU engine (funct3 = 110)
+    CPU_CFU_NTT_USE_DSP : boolean := false; -- NTT CFU multiplier: true = DSP48E1, false = behavioral
+    CPU_CFU_REJ_EN      : boolean := true -- enable rejection-sampling CFU engine (funct3 = 111)
   );
   port (
     -- global control --
@@ -278,7 +281,10 @@ begin
     neorv32_cpu_alu_cfu_inst: entity neorv32.neorv32_cpu_alu_cfu
     generic map (
       CFU_KECCAK_GEN      => CFU_KECCAK_GEN,
-      CPU_CFU_NTT_USE_DSP => CPU_CFU_NTT_USE_DSP
+      CPU_CFU_KECCAK_EN   => CPU_CFU_KECCAK_EN,
+      CPU_CFU_NTT_EN      => CPU_CFU_NTT_EN,
+      CPU_CFU_NTT_USE_DSP => CPU_CFU_NTT_USE_DSP,
+      CPU_CFU_REJ_EN      => CPU_CFU_REJ_EN
     )
     port map (
       -- global control --

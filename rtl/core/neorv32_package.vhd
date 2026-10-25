@@ -973,9 +973,10 @@ package neorv32_package is
       CPU_FAST_MUL_EN     : boolean                        := false;
       CPU_FAST_SHIFT_EN   : boolean                        := false;
       CPU_CFU_KECCAK_GEN  : natural                        := 2; -- Keccak CFU engine generation (1 = wide, 2 = serialized)
-
+      CPU_CFU_KECCAK_EN   : boolean                        := true; -- enable Keccak CFU engine (funct3 = 000..101)
       CPU_CFU_NTT_EN      : boolean                        := true;          -- enable NTT CFU engine (forward/inverse NTT + arithmetic ops)
       CPU_CFU_NTT_USE_DSP : boolean                        := false;
+      CPU_CFU_REJ_EN      : boolean                        := true; -- enable rejection-sampling CFU engine (funct3 = 111)
       CPU_RF_ARCH_SEL     : natural range 0 to 3           := 0;
       -- Physical Memory Protection (PMP) --
       PMP_NUM_REGIONS     : natural range 0 to 16          := 0;

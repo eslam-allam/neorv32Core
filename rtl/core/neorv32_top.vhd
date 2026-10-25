@@ -70,8 +70,10 @@ entity neorv32_top is
     CPU_FAST_MUL_EN     : boolean                        := false;         -- use DSPs for M extension's multiplier
     CPU_FAST_SHIFT_EN   : boolean                        := false;         -- use barrel shifter for shift operations
     CPU_CFU_KECCAK_GEN  : natural                        := 2;             -- Keccak CFU engine generation (1 = wide, 2 = serialized)
+    CPU_CFU_KECCAK_EN   : boolean                        := true;          -- enable Keccak CFU engine (funct3 = 000..101)
     CPU_CFU_NTT_EN      : boolean                        := true;          -- enable NTT CFU engine (forward/inverse NTT + arithmetic ops)
     CPU_CFU_NTT_USE_DSP : boolean                        := false;         -- NTT CFU multiplier: true = DSP48E1 (Xilinx 7-series), false = behavioral
+    CPU_CFU_REJ_EN      : boolean                        := true;          -- enable rejection-sampling CFU engine (funct3 = 111)
     CPU_RF_ARCH_SEL     : natural range 0 to 3           := 0;             -- register file implementation style select
 
     -- Physical Memory Protection (PMP) --
@@ -571,8 +573,10 @@ begin
       CPU_FAST_MUL_EN     => CPU_FAST_MUL_EN,
       CPU_FAST_SHIFT_EN   => CPU_FAST_SHIFT_EN,
       CPU_CFU_KECCAK_GEN  => CPU_CFU_KECCAK_GEN,
+      CPU_CFU_KECCAK_EN   => CPU_CFU_KECCAK_EN,
       CPU_CFU_NTT_USE_DSP => CPU_CFU_NTT_USE_DSP,
       CPU_CFU_NTT_EN      => CPU_CFU_NTT_EN,
+      CPU_CFU_REJ_EN      => CPU_CFU_REJ_EN,
       CPU_RF_ARCH_SEL     => CPU_RF_ARCH_SEL,
       -- Physical Memory Protection (PMP) --
       PMP_NUM_REGIONS     => PMP_NUM_REGIONS,

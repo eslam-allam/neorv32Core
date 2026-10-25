@@ -21,7 +21,10 @@
 --        A PERM op advances exactly ONE round (~487 cycles), so a permutation is
 --        24 ops. Area: 678 LUT / 503 FF.
 --
--- The NTT engine is optional and controlled by CPU_CFU_NTT_EN.
+-- Every engine is optional and can be removed from the design by a generic:
+-- CPU_CFU_KECCAK_EN, CPU_CFU_NTT_EN and CPU_CFU_REJ_EN. A disabled engine is not
+-- instantiated at all, and its funct3 slot is left undecoded, so the CPU treats
+-- the instruction as illegal exactly as it does when the whole CFU is absent.
 --
 -- The NEORV32 RISC-V Processor - https://github.com/stnolting/neorv32                --
 -- Copyright (c) NEORV32 contributors.                                                --
@@ -42,12 +45,18 @@ entity neorv32_cpu_alu_cfu is
     -- Keccak engine generation: 1 = wide (1 PERM op = whole permutation),
     -- 2 = serialized (1 PERM op = 1 round). Must match the software wrapper.
     CFU_KECCAK_GEN : natural := 2;
+    -- Keccak engine enable: when false, the Keccak engine is not instantiated
+    -- and funct3=000..101 are treated as illegal instructions.
+    CPU_CFU_KECCAK_EN : boolean := true;
     -- NTT engine enable: when false, the NTT engine is not instantiated and
     -- funct3=110 is treated as illegal instruction.
     CPU_CFU_NTT_EN : boolean := true;
     -- NTT multiplier implementation: true = use DSP48E1 (Xilinx 7-series),
     -- false = behavioral multiplier (tool decides: LUTs or inferred DSP)
-    CPU_CFU_NTT_USE_DSP : boolean := false
+    CPU_CFU_NTT_USE_DSP : boolean := false;
+    -- Rejection-sampling engine enable: when false, the engine is not
+    -- instantiated and funct3=111 is treated as illegal instruction.
+    CPU_CFU_REJ_EN : boolean := true
   );
   port (
     -- global control --
@@ -85,32 +94,39 @@ begin
   funct3 <= inst_i(14 downto 12);
 
   -- Keccak-f1600 engine (generation selected by CFU_KECCAK_GEN) ----------------------
-  u_keccak_gen1: if CFU_KECCAK_GEN = 1 generate
-    keccak: entity neorv32.neorv32_cpu_alu_cfu_keccak(neorv32_cpu_alu_cfu_keccak_gen1)
-      port map (
-        clk_i    => clk_i,
-        rstn_i   => rstn_i,
-        start_i  => start_i,
-        inst_i   => inst_i,
-        rs1_i    => rs1_i,
-        rs2_i    => rs2_i,
-        result_o => keccak_result_o,
-        valid_o  => keccak_valid_o
-      );
+  u_keccak: if CPU_CFU_KECCAK_EN generate
+    u_keccak_gen1: if CFU_KECCAK_GEN = 1 generate
+      keccak: entity neorv32.neorv32_cpu_alu_cfu_keccak(neorv32_cpu_alu_cfu_keccak_gen1)
+        port map (
+          clk_i    => clk_i,
+          rstn_i   => rstn_i,
+          start_i  => start_i,
+          inst_i   => inst_i,
+          rs1_i    => rs1_i,
+          rs2_i    => rs2_i,
+          result_o => keccak_result_o,
+          valid_o  => keccak_valid_o
+        );
+    end generate;
+
+    u_keccak_gen2: if CFU_KECCAK_GEN = 2 generate
+      keccak: entity neorv32.neorv32_cpu_alu_cfu_keccak(neorv32_cpu_alu_cfu_keccak_gen2)
+        port map (
+          clk_i    => clk_i,
+          rstn_i   => rstn_i,
+          start_i  => start_i,
+          inst_i   => inst_i,
+          rs1_i    => rs1_i,
+          rs2_i    => rs2_i,
+          result_o => keccak_result_o,
+          valid_o  => keccak_valid_o
+        );
+    end generate;
   end generate;
 
-  u_keccak_gen2: if CFU_KECCAK_GEN = 2 generate
-    keccak: entity neorv32.neorv32_cpu_alu_cfu_keccak(neorv32_cpu_alu_cfu_keccak_gen2)
-      port map (
-        clk_i    => clk_i,
-        rstn_i   => rstn_i,
-        start_i  => start_i,
-        inst_i   => inst_i,
-        rs1_i    => rs1_i,
-        rs2_i    => rs2_i,
-        result_o => keccak_result_o,
-        valid_o  => keccak_valid_o
-      );
+  u_keccak_off: if not CPU_CFU_KECCAK_EN generate
+    keccak_result_o <= (others => '0');
+    keccak_valid_o  <= '0';
   end generate;
 
   -- NTT Engine (stdlib sub-unit; consumes funct3 = 110) ------------------------------------
@@ -131,27 +147,43 @@ begin
       );
   end generate;
 
+  u_ntt_off: if not CPU_CFU_NTT_EN generate
+    ntt_result_o <= (others => '0');
+    ntt_valid_o  <= '0';
+  end generate;
+
   -- Rejection-Sampling Engine (stdlib sub-unit; consumes funct3 = 111) -----------------------
-  rej_engine: entity neorv32.neorv32_cpu_alu_cfu_rej
-    port map (
-      clk_i    => clk_i,
-      rstn_i   => rstn_i,
-      start_i  => start_i,
-      inst_i   => inst_i,
-      rs1_i    => rs1_i,
-      rs2_i    => rs2_i,
-      result_o => rej_result_o,
-      valid_o  => rej_valid_o
-    );
+  u_rej: if CPU_CFU_REJ_EN generate
+    rej_engine: entity neorv32.neorv32_cpu_alu_cfu_rej
+      port map (
+        clk_i    => clk_i,
+        rstn_i   => rstn_i,
+        start_i  => start_i,
+        inst_i   => inst_i,
+        rs1_i    => rs1_i,
+        rs2_i    => rs2_i,
+        result_o => rej_result_o,
+        valid_o  => rej_valid_o
+      );
+  end generate;
+
+  u_rej_off: if not CPU_CFU_REJ_EN generate
+    rej_result_o <= (others => '0');
+    rej_valid_o  <= '0';
+  end generate;
 
   -- Response mux: the engine addressed by funct3 owns the CFU response ----------------------
   -- funct3 mapping:
   --   000..101 : Keccak-f1600 (6 opcodes)
   --   110      : NTT engine (8 sub-ops via funct7)
   --   111      : Rejection sampling (8 sub-ops via funct7)
+  -- A disabled engine is not selected, so its funct3 slot never asserts valid_o and the
+  -- CPU's co-processor timeout turns the instruction into an illegal-instruction trap.
   result_o <= ntt_result_o when (CPU_CFU_NTT_EN and funct3 = cfu_ntt_c) else
-              rej_result_o when (funct3 = cfu_rej_c) else keccak_result_o;
+              rej_result_o when (CPU_CFU_REJ_EN and funct3 = cfu_rej_c) else
+              keccak_result_o;
   valid_o  <= ntt_valid_o  when (CPU_CFU_NTT_EN and funct3 = cfu_ntt_c) else
-              rej_valid_o  when (funct3 = cfu_rej_c) else keccak_valid_o;
+              rej_valid_o  when (CPU_CFU_REJ_EN and funct3 = cfu_rej_c) else
+              keccak_valid_o;
 
 end neorv32_cpu_alu_cfu_rtl;
